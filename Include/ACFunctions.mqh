@@ -40,10 +40,22 @@ datetime lastProcessedDealTime = 0;   // Time stamp to avoid reprocessing old cl
 //+------------------------------------------------------------------+
 //| Update risk based on trade result - with profit parameter        |
 //+------------------------------------------------------------------+
+void EnsureValidCompoundingWins()
+{
+   if(AC_CompoundingWins <= 0)
+   {
+      int fallbackValue = (AC_CompoundingWins_Input > 0) ? AC_CompoundingWins_Input : 1;
+      AC_CompoundingWins = fallbackValue;
+      Print("WARNING: AC_CompoundingWins was zero or negative. Using fallback value of ", AC_CompoundingWins, ".");
+   }
+}
+
 void UpdateRiskBasedOnResultWithProfit(bool isWin, int magic, double profit)
 {
+   EnsureValidCompoundingWins();
+
    double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   
+
    if(isWin)
    {
       // Calculate position in cycle (0-based index)
