@@ -5,17 +5,24 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023"
 #property link      ""
-#property version   "1.30"
+#property version   "1.36"
 #property strict
 #property description "Main trading EA with Asymmetrical Compounding Risk Management"
 
 // Include necessary libraries
 #include <Trade/Trade.mqh>
-#include "C:/Users/marth/AppData/Roaming/MetaQuotes/Terminal/E62C655ED163FFC555DD40DBEA67E6BB/MQL5/Experts/MainACAlgo/Include/ACFunctions.mqh"      // Position sizing and risk management
-#include "C:/Users/marth/AppData/Roaming/MetaQuotes/Terminal/E62C655ED163FFC555DD40DBEA67E6BB/MQL5/Experts/MainACAlgo/Include/ATRtrailing.mqh"      // Trailing stop functionality
+#include <ACFunctions.mqh>      // Position sizing and risk management
+#include <ATRtrailing.mqh>      // Trailing stop functionality
 // Include indicators as direct calculation libraries
-#include "C:/Users/marth/AppData/Roaming/MetaQuotes/Terminal/E62C655ED163FFC555DD40DBEA67E6BB/MQL5/Experts/MainACAlgo/Indicators/T3.mqh"             // T3 indicator calculations
-#include "C:/Users/marth/AppData/Roaming/MetaQuotes/Terminal/E62C655ED163FFC555DD40DBEA67E6BB/MQL5/Experts/MainACAlgo/Indicators/vwap_lite.mqh"         // VWAP indicator calculations
+#include <T3.mqh>               // T3 indicator calculations
+#include <vwap_lite.mqh>        // VWAP indicator calculations
+#include <EngulfingSignals.mqh>       // Engulfing pattern detection
+#include <EngulfingStochastic.mqh>    // Engulfing + Stochastic combo
+#include <QQEIndicator.mqh>           // QQE signal calculations
+#include <SuperTrendIndicator.mqh>    // SuperTrend trend detection
+#include <FiboZigZag.mqh>             // Fibonacci ZigZag detection
+#include <IntrabarVolume.mqh>         // Intrabar volume filter
+#include <TotalPowerIndicator.mqh>    // Total power indicator filter
 
 // Custom enum for VWAP timeframes with DISABLED option
 enum ENUM_VWAP_TIMEFRAMES
@@ -42,6 +49,14 @@ enum ENUM_VWAP_TIMEFRAMES
    VWAP_D1 = PERIOD_D1,     // Daily
    VWAP_W1 = PERIOD_W1,     // Weekly
    VWAP_MN1 = PERIOD_MN1    // Monthly
+};
+
+// Trade direction bias control
+enum ENUM_TRADE_BIAS
+{
+   BIAS_LONG_AND_SHORT = 0,   // Allow both long and short trades
+   BIAS_LONG_ONLY      = 1,   // Only permit long entries
+   BIAS_SHORT_ONLY     = 2    // Only permit short entries
 };
 
 //--- Performance Optimization Settings
@@ -81,6 +96,7 @@ input int      T3_Length = 12;          // Period length for T3 calculation
 input double   T3_Factor = 0.7;         // Volume factor for T3 calculation
 input ENUM_APPLIED_PRICE T3_Applied_Price = PRICE_CLOSE; // Price type for T3
 input bool     T3_UseTickPrecision = false; // Use tick-level precision for T3 (slower but more accurate)
+input bool     UseT3VWAPFilter = true;  // Use T3 vs VWAP crossover as a signal filter
 
 //--- VWAP Indicator Settings
 input group "==== VWAP Indicator Settings ===="
@@ -90,6 +106,10 @@ input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe1 = VWAP_M1;  // VWAP Timeframe 1
 input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe2 = VWAP_M5;   // VWAP Timeframe 2
 input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe3 = VWAP_M15;   // VWAP Timeframe 3
 input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe4 = VWAP_DISABLED; // VWAP Timeframe 4 (DISABLED = don't use)
+input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe5 = VWAP_DISABLED; // VWAP Timeframe 5
+input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe6 = VWAP_DISABLED; // VWAP Timeframe 6
+input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe7 = VWAP_DISABLED; // VWAP Timeframe 7
+input ENUM_VWAP_TIMEFRAMES VWAP_Timeframe8 = VWAP_DISABLED; // VWAP Timeframe 8
 input ENUM_APPLIED_PRICE VWAP_Price_Type = PRICE_CLOSE; // Price type for VWAP
 input bool     VWAP_UseTickPrecision = false; // Use tick-level precision for VWAP (slower but more accurate)
 
@@ -97,6 +117,72 @@ input bool     VWAP_UseTickPrecision = false; // Use tick-level precision for VW
 input group "==== Entry Signal Settings ===="
 input bool     UseAutomaticTrading = false; // Enable automatic trading based on indicators
 input int      SignalConfirmationBars = 2;  // Number of bars to confirm signal
+input int      MinSignalsToEnterLong = 1;     // Minimum aligned signals required for long entries
+input int      MinSignalsToEnterShort = 1;    // Minimum aligned signals required for short entries
+input int      MinSignalsToEnterBoth = 1;     // Minimum aligned signals when both directions allowed
+input ENUM_TRADE_BIAS TradeDirectionBias = BIAS_LONG_AND_SHORT; // Directional bias filter
+
+//--- Engulfing Pattern Settings
+input group "==== Engulfing Pattern Settings ===="
+input bool     UseEngulfingPattern = false;           // Enable basic engulfing pattern signal
+
+//--- Engulfing + Stochastic Settings
+input group "==== Engulfing Stochastic Settings ===="
+input bool     UseEngulfingStochastic = false;        // Enable engulfing + stochastic confirmation
+input int      EngulfingStoch_OverSold = 20;          // Oversold threshold
+input int      EngulfingStoch_OverBought = 80;        // Overbought threshold
+input int      EngulfingStoch_KPeriod = 5;            // Stochastic K period
+input int      EngulfingStoch_DPeriod = 3;            // Stochastic D period
+input int      EngulfingStoch_Slowing = 3;            // Stochastic slowing
+input ENUM_MA_METHOD EngulfingStoch_MAMethod = MODE_SMA; // Smoothing method
+input ENUM_STO_PRICE EngulfingStoch_PriceField = STO_LOWHIGH; // Price field for stochastic
+input ENUM_TIMEFRAMES EngulfingStoch_Timeframe = PERIOD_CURRENT; // Timeframe override
+
+//--- QQE Indicator Settings
+input group "==== QQE Indicator Settings ===="
+input bool     UseQQEIndicator = false;               // Enable QQE filter
+input int      QQE_RSI_Period = 14;                   // RSI period
+input int      QQE_SmoothingFactor = 5;               // QQE smoothing factor (SF)
+input double   QQE_AlertLevel = 50.0;                 // Alert level threshold
+input bool     QQE_RequireLevelFilter = true;         // Require level alignment with alert level
+input ENUM_TIMEFRAMES QQE_Timeframe = PERIOD_CURRENT; // QQE timeframe
+
+//--- SuperTrend Settings
+input group "==== SuperTrend Settings ===="
+input bool     UseSuperTrendIndicator = false;        // Enable SuperTrend direction filter
+input int      SuperTrend_ATRPeriod = 22;             // ATR period for SuperTrend
+input double   SuperTrend_Multiplier = 3.0;           // ATR multiplier
+input ENUM_APPLIED_PRICE SuperTrend_PriceSource = PRICE_MEDIAN; // Base price
+input bool     SuperTrend_TakeWicks = true;           // Include full wick range
+input ENUM_TIMEFRAMES SuperTrend_Timeframe = PERIOD_CURRENT;    // Timeframe override
+
+//--- Fibo ZigZag Settings
+input group "==== Fibo ZigZag Settings ===="
+input bool     UseFiboZigZagFilter = false;         // Enable Fibonacci ZigZag confirmation
+input double   FiboRetracement = 23.6;              // Minimum retracement percentage to flip trend
+input double   FiboMinWaveATR = 0.5;                // Minimum wave size in ATR units
+input int      FiboATRPeriod = 14;                  // ATR lookback for wave sizing
+input bool     FiboUseHighLowPrice = true;          // Use high/low extremes instead of closes
+input bool     FiboUseATRFilter = true;             // Enforce ATR-sized wave threshold
+input bool     FiboRequireConfirmation = false;     // Require signal to persist for N bars
+input int      FiboConfirmationBars = 1;            // Bars required for confirmation (if enabled)
+
+//--- Intrabar Volume Settings
+input group "==== Intrabar Volume Settings ===="
+input bool     UseIntrabarVolumeFilter = false;     // Enable intrabar volume confirmation
+input int      IntrabarVolumePeriod = 20;           // Moving average period for trend detection
+input int      IntrabarVolumeLookback = 20;         // Lookback for volume threshold
+input bool     IntrabarGranularTrend = false;       // Use granular trend (close vs previous close)
+input bool     IntrabarRequireVolume = true;        // Require tick volume to exceed threshold
+
+//--- Total Power Indicator Settings
+input group "==== Total Power Indicator Settings ===="
+input bool     UseTotalPowerFilter = false;         // Enable Total Power confirmation
+input int      TPILookbackPeriod = 45;              // Lookback period for power calculation
+input int      TPIPowerPeriod = 10;                 // Power period for Bears/Bulls
+input bool     TPIUseHundredSignal = false;         // Signal on 100% dominance
+input bool     TPIUseCrossoverSignal = false;       // Signal on bull/bear crossover
+input int      TPITriggerCandle = 1;                // Candle shift for evaluation (0=current,1=previous)
 
 //--- Custom Results For Optimization (These will show in optimization results)
 //input group "==== Custom Optimization Results ===="
@@ -122,6 +208,13 @@ string SellButtonName = "SellButton"; // Name for Sell button
 // Indicator instances
 CT3Indicator T3;                // T3 indicator instance
 CVWAPIndicator VWAP;            // VWAP indicator instance
+CEngulfingSignalDetector EngulfingDetector;        // Basic engulfing pattern helper
+CEngulfingStochasticSignal EngulfingStochSignal;   // Engulfing + stochastic combo
+CQQEIndicator QQESignal;                           // QQE signal helper
+CSuperTrendIndicator SuperTrendSignal;             // SuperTrend helper
+CFiboZigZag FiboZigZagSignal;                      // Fibonacci ZigZag helper
+CIntrabarVolumeIndicator IntrabarVolumeSignal;      // Intrabar volume helper
+CTotalPowerIndicator TotalPowerSignal;              // Total power indicator helper
 
 // Indicator buffers
 double T3Buffer[];                 // Buffer for T3 indicator values
@@ -130,6 +223,10 @@ double VWAPTF1Buffer[];            // Buffer for VWAP Timeframe 1 values
 double VWAPTF2Buffer[];            // Buffer for VWAP Timeframe 2 values
 double VWAPTF3Buffer[];            // Buffer for VWAP Timeframe 3 values
 double VWAPTF4Buffer[];            // Buffer for VWAP Timeframe 4 values
+double VWAPTF5Buffer[];            // Buffer for VWAP Timeframe 5 values
+double VWAPTF6Buffer[];            // Buffer for VWAP Timeframe 6 values
+double VWAPTF7Buffer[];            // Buffer for VWAP Timeframe 7 values
+double VWAPTF8Buffer[];            // Buffer for VWAP Timeframe 8 values
 
 // Price arrays for indicators
 double priceDataT3[];
@@ -149,11 +246,41 @@ double prevVWAPTF3 = 0;
 double currVWAPTF3 = 0;
 double prevVWAPTF4 = 0;
 double currVWAPTF4 = 0;
+double prevVWAPTF5 = 0;
+double currVWAPTF5 = 0;
+double prevVWAPTF6 = 0;
+double currVWAPTF6 = 0;
+double prevVWAPTF7 = 0;
+double currVWAPTF7 = 0;
+double prevVWAPTF8 = 0;
+double currVWAPTF8 = 0;
+
+// Additional indicator state
+int    g_T3VWAPSignal = 0;
+int    g_EngulfingSignal = 0;
+int    g_EngulfingStochSignal = 0;
+int    g_QQESignal = 0;
+int    g_SuperTrendSignal = 0;
+int    g_FiboZigZagSignal = 0;
+int    g_IntrabarVolumeSignal = 0;
+int    g_TotalPowerSignal = 0;
+double g_QQERsiMA = 0.0;
+double g_QQETrLevel = 0.0;
+double g_SuperTrendValue = 0.0;
+
+bool   g_EngulfingStochReady = false;
+bool   g_QQEReady = false;
+bool   g_SuperTrendReady = false;
+bool   g_FiboZigZagReady = false;
+bool   g_TotalPowerReady = false;
 
 // Optimization variables
 datetime lastBarTime = 0;           // Time of the last processed bar
 int tickCounter = 0;                // Counter for updating on specific ticks
 bool isInBacktest = false;          // Flag for backtest mode
+bool isForwardTest = false;         // Flag for forward test stage during optimization
+bool isFastModeContext = false;     // Indicates optimization/forward contexts where we throttle work
+bool allowVerboseLogs = true;       // Helper to disable noisy logging during tester runs
 
 // Custom optimization reporting parameters
 double customWinRate = 0;            // Win rate for optimization results
@@ -171,11 +298,18 @@ double customAvgLossAmount = 0;      // Average loss amount
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   // Check if we're in optimization/backtesting mode
-   isInBacktest = MQLInfoInteger(MQL_OPTIMIZATION) || MQLInfoInteger(MQL_TESTER);
+   // Determine tester context flags up front
+   bool isOptimizationPass = (MQLInfoInteger(MQL_OPTIMIZATION) == 1);
+   bool isTesterPass = (MQLInfoInteger(MQL_TESTER) == 1);
+   isForwardTest = (MQLInfoInteger(MQL_FORWARD) == 1);
+   
+   // Treat both optimization and forward phases as "fast mode" to throttle heavy work
+   isInBacktest = isOptimizationPass || isTesterPass;
+   isFastModeContext = isInBacktest && (OptimizationMode || isForwardTest);
+   allowVerboseLogs = !isFastModeContext;
    
    // Clear existing objects from the chart first (except indicators)
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
    {
       Print("Clearing chart objects before initializing EA...");
       
@@ -231,13 +365,13 @@ int OnInit()
    // Initialize risk management system
    InitializeACRiskManagement();
    
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("Asymmetrical Compounding Risk Management initialized with base risk: ", AC_BaseRisk, "%");
    
    // Initialize ATR trailing stop system
    InitDEMAATR();
    
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("DEMA-ATR trailing system initialized without visual indicators");
    
    // Initialize T3 indicator
@@ -245,16 +379,16 @@ int OnInit()
    {
       // Initialize price arrays for T3
       ArraySetAsSeries(priceDataT3, true);
-      ArrayResize(priceDataT3, isInBacktest && OptimizationMode ? 200 : 1000);
+      ArrayResize(priceDataT3, isFastModeContext ? 200 : 1000);
       
       // Initialize the T3 indicator class
       T3.Init(T3_Length, T3_Factor, T3_Applied_Price, T3_UseTickPrecision);
       
       // Allocate memory for T3 buffer
       ArraySetAsSeries(T3Buffer, true);
-      ArrayResize(T3Buffer, isInBacktest && OptimizationMode ? 10 : 100);
+      ArrayResize(T3Buffer, isFastModeContext ? 10 : 100);
       
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("T3 indicator initialized successfully");
    }
    
@@ -276,23 +410,28 @@ int OnInit()
       }
       
       // In backtest mode, force disable tick precision for VWAP to improve performance
-      bool useTickPrecision = isInBacktest && OptimizationMode ? false : VWAP_UseTickPrecision;
+      bool useTickPrecision = isFastModeContext ? false : VWAP_UseTickPrecision;
       
       // Convert custom timeframe enums to standard ENUM_TIMEFRAMES
       ENUM_TIMEFRAMES tf1 = (VWAP_Timeframe1 == VWAP_DISABLED) ? 
                            PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe1;
-                           
       ENUM_TIMEFRAMES tf2 = (VWAP_Timeframe2 == VWAP_DISABLED) ? 
                            PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe2;
-                           
       ENUM_TIMEFRAMES tf3 = (VWAP_Timeframe3 == VWAP_DISABLED) ? 
                            PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe3;
-                           
       ENUM_TIMEFRAMES tf4 = (VWAP_Timeframe4 == VWAP_DISABLED) ? 
                            PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe4;
+      ENUM_TIMEFRAMES tf5 = (VWAP_Timeframe5 == VWAP_DISABLED) ? 
+                           PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe5;
+      ENUM_TIMEFRAMES tf6 = (VWAP_Timeframe6 == VWAP_DISABLED) ? 
+                           PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe6;
+      ENUM_TIMEFRAMES tf7 = (VWAP_Timeframe7 == VWAP_DISABLED) ? 
+                           PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe7;
+      ENUM_TIMEFRAMES tf8 = (VWAP_Timeframe8 == VWAP_DISABLED) ? 
+                           PERIOD_CURRENT : (ENUM_TIMEFRAMES)VWAP_Timeframe8;
       
       // Initialize the VWAP indicator class
-      VWAP.Init(priceType, Enable_Daily_VWAP, tf1, tf2, tf3, tf4, useTickPrecision);
+      VWAP.Init(priceType, Enable_Daily_VWAP, tf1, tf2, tf3, tf4, tf5, tf6, tf7, tf8, useTickPrecision);
       
       // Initialize price arrays for VWAP and prepare MqlRates for bar data
       ArraySetAsSeries(priceRates, true);
@@ -303,17 +442,108 @@ int OnInit()
       ArraySetAsSeries(VWAPTF2Buffer, true);
       ArraySetAsSeries(VWAPTF3Buffer, true);
       ArraySetAsSeries(VWAPTF4Buffer, true);
+      ArraySetAsSeries(VWAPTF5Buffer, true);
+      ArraySetAsSeries(VWAPTF6Buffer, true);
+      ArraySetAsSeries(VWAPTF7Buffer, true);
+      ArraySetAsSeries(VWAPTF8Buffer, true);
       
-      int bufferSize = isInBacktest && OptimizationMode ? 10 : 100;
+      int bufferSize = isFastModeContext ? 10 : 100;
       
       ArrayResize(VWAPDailyBuffer, bufferSize);
       ArrayResize(VWAPTF1Buffer, bufferSize);
       ArrayResize(VWAPTF2Buffer, bufferSize);
       ArrayResize(VWAPTF3Buffer, bufferSize);
       ArrayResize(VWAPTF4Buffer, bufferSize);
-      
-      if(!OptimizationMode || !isInBacktest)
+      ArrayResize(VWAPTF5Buffer, bufferSize);
+      ArrayResize(VWAPTF6Buffer, bufferSize);
+      ArrayResize(VWAPTF7Buffer, bufferSize);
+      ArrayResize(VWAPTF8Buffer, bufferSize);
+   
+      if(allowVerboseLogs)
          Print("VWAP indicator initialized successfully");
+   }
+
+   // Initialize additional signal modules
+   EngulfingDetector.Reset();
+   g_EngulfingSignal = 0;
+
+   EngulfingStochSignal.Shutdown();
+   g_EngulfingStochSignal = 0;
+   g_EngulfingStochReady = false;
+   if(UseEngulfingStochastic)
+   {
+      g_EngulfingStochReady = EngulfingStochSignal.Init(_Symbol,
+                                                        EngulfingStoch_Timeframe,
+                                                        EngulfingStoch_OverSold,
+                                                        EngulfingStoch_OverBought,
+                                                        EngulfingStoch_KPeriod,
+                                                        EngulfingStoch_DPeriod,
+                                                        EngulfingStoch_Slowing,
+                                                        EngulfingStoch_MAMethod,
+                                                        EngulfingStoch_PriceField);
+
+      if(!g_EngulfingStochReady && allowVerboseLogs)
+         Print("[Init] Engulfing stochastic module failed to initialise - signal disabled.");
+   }
+
+   QQESignal.Shutdown();
+   g_QQEReady = false;
+   g_QQESignal = 0;
+   if(UseQQEIndicator)
+   {
+      g_QQEReady = QQESignal.Init(_Symbol,
+                                   QQE_Timeframe,
+                                   QQE_RSI_Period,
+                                   QQE_SmoothingFactor,
+                                   QQE_AlertLevel,
+                                   QQE_RequireLevelFilter);
+
+      if(!g_QQEReady && allowVerboseLogs)
+         Print("[Init] QQE module failed to initialise - signal disabled.");
+   }
+
+   SuperTrendSignal.Shutdown();
+   g_SuperTrendReady = false;
+   g_SuperTrendSignal = 0;
+   if(UseSuperTrendIndicator)
+   {
+      g_SuperTrendReady = SuperTrendSignal.Init(_Symbol,
+                                                SuperTrend_Timeframe,
+                                                SuperTrend_ATRPeriod,
+                                                SuperTrend_Multiplier,
+                                                SuperTrend_PriceSource,
+                                                SuperTrend_TakeWicks);
+
+      if(!g_SuperTrendReady && allowVerboseLogs)
+         Print("[Init] SuperTrend module failed to initialise - signal disabled.");
+   }
+
+   g_FiboZigZagSignal = 0;
+   g_IntrabarVolumeSignal = 0;
+   g_TotalPowerSignal = 0;
+   g_FiboZigZagReady = false;
+   g_TotalPowerReady = false;
+   if(UseFiboZigZagFilter)
+   {
+      FiboZigZagSignal.Init(FiboRetracement, FiboMinWaveATR, FiboATRPeriod,
+                            FiboUseHighLowPrice, FiboUseATRFilter,
+                            FiboRequireConfirmation, FiboConfirmationBars);
+      g_FiboZigZagReady = true;
+      if(allowVerboseLogs)
+         Print("[Init] Fibo ZigZag module initialised.");
+   }
+
+   IntrabarVolumeSignal.Init(IntrabarVolumePeriod, IntrabarVolumeLookback,
+                             IntrabarGranularTrend, IntrabarRequireVolume);
+
+   if(UseTotalPowerFilter)
+   {
+      g_TotalPowerReady = TotalPowerSignal.Init(_Symbol, PERIOD_CURRENT,
+                                                TPILookbackPeriod, TPIPowerPeriod,
+                                                TPIUseHundredSignal, TPIUseCrossoverSignal,
+                                                TPITriggerCandle);
+      if(!g_TotalPowerReady && allowVerboseLogs)
+         Print("[Init] Total Power Indicator failed to initialise - signal disabled.");
    }
    
    // Create buttons for manual trading only when not in backtest mode
@@ -323,7 +553,7 @@ int OnInit()
       CreateButton(SellButtonName, "SELL", SellButtonX, SellButtonY, SellButtonColor);
    }
    
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
    {
       Print("=================================");
       Print("✓ MainACAlgorithm EA initialized successfully");
@@ -333,6 +563,14 @@ int OnInit()
       Print("✓ Risk Management Mode: ", UseACRiskManagement ? "Dynamic (AC)" : "Fixed lot");
       Print("✓ T3 indicator: ", UseT3Indicator ? "Enabled" : "Disabled");
       Print("✓ VWAP indicator: ", UseVWAPIndicator ? "Enabled" : "Disabled");
+      Print("✓ T3/VWAP filter: ", (UseT3VWAPFilter && UseT3Indicator && UseVWAPIndicator) ? "Enabled" : "Disabled");
+      Print("✓ Engulfing pattern: ", UseEngulfingPattern ? "Enabled" : "Disabled");
+      Print("✓ Engulfing + Stochastic: ", (UseEngulfingStochastic && g_EngulfingStochReady) ? "Enabled" : "Disabled");
+      Print("✓ QQE filter: ", (UseQQEIndicator && g_QQEReady) ? "Enabled" : "Disabled");
+      Print("✓ SuperTrend filter: ", (UseSuperTrendIndicator && g_SuperTrendReady) ? "Enabled" : "Disabled");
+      Print("✓ Fibo ZigZag filter: ", (UseFiboZigZagFilter && g_FiboZigZagReady) ? "Enabled" : "Disabled");
+      Print("✓ Intrabar volume filter: ", UseIntrabarVolumeFilter ? "Enabled" : "Disabled");
+      Print("✓ Total Power filter: ", (UseTotalPowerFilter && g_TotalPowerReady) ? "Enabled" : "Disabled");
       Print("✓ Automatic trading: ", UseAutomaticTrading ? "Enabled" : "Disabled");
       Print("✓ Optimization Mode: ", OptimizationMode ? "Enabled" : "Disabled");
       Print("=================================");
@@ -351,20 +589,24 @@ void OnDeinit(const int reason)
    {
       // Note: Unfortunately direct parameter setting is not supported during runtime in MQL5
       // So we'll just ensure the values are available for the OnTester function
-      Print("Final optimization metrics:");
-      Print("Win Rate: ", customWinRate, "%");
-      Print("Winning Trades: ", customWinningTrades);
-      Print("Losing Trades: ", customLosingTrades);
-      Print("Final Balance: ", customFinalBalance);
-      Print("Avg Trades Per Day: ", customAvgTradesDaily);
-      Print("Max Consecutive Winners: ", customMaxConsecWinners);
-      Print("Max Consecutive Losers: ", customMaxConsecLosers);
-      Print("Avg Win Amount: ", customAvgWinAmount);
-      Print("Avg Loss Amount: ", customAvgLossAmount);
+      if(allowVerboseLogs)
+      {
+         Print("Final optimization metrics:");
+         Print("Win Rate: ", customWinRate, "%");
+         Print("Winning Trades: ", customWinningTrades);
+         Print("Losing Trades: ", customLosingTrades);
+         Print("Final Balance: ", customFinalBalance);
+         Print("Avg Trades Per Day: ", customAvgTradesDaily);
+         Print("Max Consecutive Winners: ", customMaxConsecWinners);
+         Print("Max Consecutive Losers: ", customMaxConsecLosers);
+         Print("Avg Win Amount: ", customAvgWinAmount);
+         Print("Avg Loss Amount: ", customAvgLossAmount);
+      }
    }
 
    // More aggressive cleanup of ALL objects to ensure no leftovers
-   Print("Performing complete cleanup of all EA objects...");
+   if(allowVerboseLogs)
+      Print("Performing complete cleanup of all EA objects...");
    
    // Clean up specific named buttons
    ObjectDelete(0, BuyButtonName);
@@ -390,11 +632,23 @@ void OnDeinit(const int reason)
    
    // Clean up ATR trailing objects
    CleanupATRTrailing();
+
+   // Release aux indicator resources
+   EngulfingStochSignal.Shutdown();
+   QQESignal.Shutdown();
+   SuperTrendSignal.Shutdown();
+   FiboZigZagSignal.ResetState();
+   g_FiboZigZagReady = false;
+   g_FiboZigZagSignal = 0;
+   TotalPowerSignal.Shutdown();
+    g_TotalPowerReady = false;
+    g_TotalPowerSignal = 0;
    
    // Force chart redraw to ensure all objects are cleared visually
    ChartRedraw();
    
-   Print("MainACAlgorithm EA removed - all objects cleaned up");
+   if(allowVerboseLogs)
+      Print("MainACAlgorithm EA removed - all objects cleaned up");
 }
 
 //+------------------------------------------------------------------+
@@ -403,7 +657,7 @@ void OnDeinit(const int reason)
 void OnTick()
 {
    // Only update trailing stops when necessary
-   if(isInBacktest && OptimizationMode)
+   if(isFastModeContext)
    {
       tickCounter++;
       // Only update on specific ticks to reduce processing load during backtesting
@@ -420,10 +674,10 @@ void OnTick()
    bool newBar = currentBarTime != lastBarTime;
    
    // Update trailing stops for all open positions
-   UpdateAllTrailingStops();
+   UpdateAllTrailingStops(newBar);
    
    // Update indicators only on new bars or when not in optimization mode
-   if(newBar || !OptimizationMode || !isInBacktest)
+   if(newBar || allowVerboseLogs)
    {
       lastBarTime = currentBarTime;
       UpdateIndicators();
@@ -440,24 +694,32 @@ void OnTick()
 void UpdateIndicators()
 {
    // Get current price data - optimized to use smaller buffer in backtest mode
-   int barsToRequest = isInBacktest && OptimizationMode ? 20 : 100;
+   int barsToRequest = isFastModeContext ? 20 : 100;
+   int requiredBars = 0;
+   requiredBars = MathMax(requiredBars, FiboATRPeriod + FiboConfirmationBars + 5);
+   requiredBars = MathMax(requiredBars, IntrabarVolumeLookback + IntrabarVolumePeriod + 5);
+   requiredBars = MathMax(requiredBars, TPILookbackPeriod + TPIPowerPeriod + TPITriggerCandle + 5);
+   requiredBars = MathMax(requiredBars, T3_Length + 5);
+   if(barsToRequest < requiredBars)
+      barsToRequest = requiredBars;
    
    if(CopyRates(_Symbol, PERIOD_CURRENT, 0, barsToRequest, priceRates) <= 0)
    {
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("Error copying rates data: ", GetLastError());
       return;
    }
+   ArraySetAsSeries(priceRates, true);
+   int ratesCount = ArraySize(priceRates);
    
    // Update T3 indicator values if enabled
    if(UseT3Indicator)
    {
       // Prepare price array based on selected price type - only resize if absolutely necessary
-      int ratesSize = ArraySize(priceRates);
-      if(ArraySize(priceDataT3) < ratesSize)
-         ArrayResize(priceDataT3, ratesSize);
+      if(ArraySize(priceDataT3) < ratesCount)
+         ArrayResize(priceDataT3, ratesCount);
       
-      for(int i = 0; i < ratesSize; i++)
+      for(int i = 0; i < ratesCount; i++)
       {
          switch(T3_Applied_Price)
          {
@@ -489,7 +751,7 @@ void UpdateIndicators()
    if(UseVWAPIndicator)
    {
       // In backtest/optimization mode, always use bar precision for better performance
-      bool useTickPrecision = isInBacktest && OptimizationMode ? false : VWAP_UseTickPrecision;
+      bool useTickPrecision = isFastModeContext ? false : VWAP_UseTickPrecision;
       
       if(useTickPrecision)
       {
@@ -498,12 +760,11 @@ void UpdateIndicators()
          double tickPrices[];
          long tickVolumes[];
          
-         int ratesSize = ArraySize(priceRates);
-         ArrayResize(tickTimes, ratesSize);
-         ArrayResize(tickPrices, ratesSize);
-         ArrayResize(tickVolumes, ratesSize);
+         ArrayResize(tickTimes, ratesCount);
+         ArrayResize(tickPrices, ratesCount);
+         ArrayResize(tickVolumes, ratesCount);
          
-         for(int i = 0; i < ratesSize; i++)
+         for(int i = 0; i < ratesCount; i++)
          {
             tickTimes[i] = priceRates[i].time;
             
@@ -524,12 +785,12 @@ void UpdateIndicators()
          }
          
          // Calculate VWAP using tick-level precision with safety check
-         SafeCalculateVWAP(tickTimes, tickPrices, tickVolumes, ratesSize);
+         SafeCalculateVWAP(tickTimes, tickPrices, tickVolumes, ratesCount);
       }
       else
       {
          // Calculate VWAP using bar-level precision - much faster
-         SafeCalculateVWAPOnBar(priceRates, ArraySize(priceRates));
+         SafeCalculateVWAPOnBar(priceRates, ratesCount);
       }
       
       // Update VWAP values for signal detection
@@ -559,12 +820,79 @@ void UpdateIndicators()
          prevVWAPTF4 = currVWAPTF4;
          currVWAPTF4 = VWAPTF4Buffer[1];
       }
+
+      if(VWAP_Timeframe5 != VWAP_DISABLED)
+      {
+         prevVWAPTF5 = currVWAPTF5;
+         currVWAPTF5 = VWAPTF5Buffer[1];
+      }
+
+      if(VWAP_Timeframe6 != VWAP_DISABLED)
+      {
+         prevVWAPTF6 = currVWAPTF6;
+         currVWAPTF6 = VWAPTF6Buffer[1];
+      }
+
+      if(VWAP_Timeframe7 != VWAP_DISABLED)
+      {
+         prevVWAPTF7 = currVWAPTF7;
+         currVWAPTF7 = VWAPTF7Buffer[1];
+      }
+
+      if(VWAP_Timeframe8 != VWAP_DISABLED)
+      {
+         prevVWAPTF8 = currVWAPTF8;
+         currVWAPTF8 = VWAPTF8Buffer[1];
+      }
    }
    
    // We've disabled visualization, but keeping this for compatibility
    // The condition will always be false since we set ShowATRLevels=false in OnInit
    if(ShowATRLevels && !isInBacktest)
       UpdateVisualization();
+
+   // Update auxiliary signals after core indicators are refreshed
+   if(UseEngulfingPattern)
+      g_EngulfingSignal = EngulfingDetector.Evaluate(priceRates, ratesCount);
+   else
+      g_EngulfingSignal = 0;
+
+   if(UseEngulfingStochastic && g_EngulfingStochReady)
+      g_EngulfingStochSignal = EngulfingStochSignal.Evaluate(priceRates, ratesCount);
+   else
+      g_EngulfingStochSignal = 0;
+
+   if(UseQQEIndicator && g_QQEReady)
+      g_QQESignal = QQESignal.Evaluate(priceRates, ratesCount, g_QQERsiMA, g_QQETrLevel);
+   else
+   {
+      g_QQESignal = 0;
+      g_QQERsiMA = 0.0;
+      g_QQETrLevel = 0.0;
+   }
+
+   if(UseSuperTrendIndicator && g_SuperTrendReady)
+      g_SuperTrendSignal = SuperTrendSignal.Evaluate(priceRates, ratesCount, g_SuperTrendValue);
+   else
+   {
+      g_SuperTrendSignal = 0;
+      g_SuperTrendValue = 0.0;
+   }
+
+   if(UseFiboZigZagFilter && g_FiboZigZagReady)
+      g_FiboZigZagSignal = FiboZigZagSignal.Evaluate(priceRates, ratesCount);
+   else
+      g_FiboZigZagSignal = 0;
+
+   if(UseIntrabarVolumeFilter)
+      g_IntrabarVolumeSignal = IntrabarVolumeSignal.Evaluate(priceRates, ratesCount);
+   else
+      g_IntrabarVolumeSignal = 0;
+
+   if(UseTotalPowerFilter && g_TotalPowerReady)
+      g_TotalPowerSignal = TotalPowerSignal.Evaluate(priceRates, ratesCount);
+   else
+      g_TotalPowerSignal = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -585,6 +913,10 @@ void SafeCalculateVWAP(const datetime &time[], const double &price[],
       ArrayResize(VWAPTF2Buffer, bufferSize);
       ArrayResize(VWAPTF3Buffer, bufferSize);
       ArrayResize(VWAPTF4Buffer, bufferSize);
+      ArrayResize(VWAPTF5Buffer, bufferSize);
+      ArrayResize(VWAPTF6Buffer, bufferSize);
+      ArrayResize(VWAPTF7Buffer, bufferSize);
+      ArrayResize(VWAPTF8Buffer, bufferSize);
    }
    
    // For safety during optimization, limit data_count to buffer size
@@ -593,7 +925,8 @@ void SafeCalculateVWAP(const datetime &time[], const double &price[],
    // Call the actual VWAP calculation with the safe count
    VWAP.CalculateOnTick(time, price, volume, safe_count,
                        VWAPDailyBuffer, VWAPTF1Buffer, VWAPTF2Buffer, 
-                       VWAPTF3Buffer, VWAPTF4Buffer);
+                       VWAPTF3Buffer, VWAPTF4Buffer, VWAPTF5Buffer,
+                       VWAPTF6Buffer, VWAPTF7Buffer, VWAPTF8Buffer);
 }
 
 //+------------------------------------------------------------------+
@@ -613,6 +946,10 @@ void SafeCalculateVWAPOnBar(const MqlRates &rates[], int rates_count)
       ArrayResize(VWAPTF2Buffer, bufferSize);
       ArrayResize(VWAPTF3Buffer, bufferSize);
       ArrayResize(VWAPTF4Buffer, bufferSize);
+      ArrayResize(VWAPTF5Buffer, bufferSize);
+      ArrayResize(VWAPTF6Buffer, bufferSize);
+      ArrayResize(VWAPTF7Buffer, bufferSize);
+      ArrayResize(VWAPTF8Buffer, bufferSize);
    }
    
    // For safety during optimization, limit rates_count to buffer size
@@ -620,7 +957,152 @@ void SafeCalculateVWAPOnBar(const MqlRates &rates[], int rates_count)
    
    // Call the actual VWAP calculation with the safe count
    VWAP.CalculateOnBar(rates, safe_count, VWAPDailyBuffer, VWAPTF1Buffer, 
-                      VWAPTF2Buffer, VWAPTF3Buffer, VWAPTF4Buffer);
+                      VWAPTF2Buffer, VWAPTF3Buffer, VWAPTF4Buffer,
+                      VWAPTF5Buffer, VWAPTF6Buffer, VWAPTF7Buffer, VWAPTF8Buffer);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: accumulate signal votes                                   |
+//+------------------------------------------------------------------+
+void RegisterSignalVote(const int signal, int &buyVotes, int &sellVotes, int &voteCount)
+{
+   if(signal > 0)
+   {
+      buyVotes++;
+      voteCount++;
+   }
+   else if(signal < 0)
+   {
+      sellVotes++;
+      voteCount++;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Helper: resolve directional signal based on configuration        |
+//+------------------------------------------------------------------+
+int CombineSignalVotes(const int &signals[], const bool &enabled[], const int moduleCount)
+{
+   int buyVotes = 0;
+   int sellVotes = 0;
+   int voteCount = 0;
+
+   for(int i = 0; i < moduleCount; ++i)
+   {
+      if(!enabled[i])
+         continue;
+      RegisterSignalVote(signals[i], buyVotes, sellVotes, voteCount);
+   }
+
+   int resolvedSignal = 0;
+
+   // Determine applicable thresholds based on bias configuration
+   bool allowLongs  = (TradeDirectionBias != BIAS_SHORT_ONLY);
+   bool allowShorts = (TradeDirectionBias != BIAS_LONG_ONLY);
+
+   int longThreshold  = MathMax(1, (TradeDirectionBias == BIAS_LONG_ONLY)
+                                   ? MinSignalsToEnterLong
+                                   : MinSignalsToEnterBoth);
+   int shortThreshold = MathMax(1, (TradeDirectionBias == BIAS_SHORT_ONLY)
+                                   ? MinSignalsToEnterShort
+                                   : MinSignalsToEnterBoth);
+
+   // Evaluate long bias first if permitted
+   if(allowLongs && buyVotes >= longThreshold && sellVotes == 0)
+      resolvedSignal = 1;
+
+   // Evaluate short bias, ensuring no conflicting long decision
+   if(allowShorts && sellVotes >= shortThreshold && buyVotes == 0)
+   {
+      if(resolvedSignal != 0)
+         resolvedSignal = 0; // Conflict - skip trade
+      else
+         resolvedSignal = -1;
+   }
+
+   if(resolvedSignal != 0 && allowVerboseLogs)
+   {
+      PrintFormat("[Signals] Votes -> Buy: %d (threshold %d), Sell: %d (threshold %d), Bias: %d",
+                  buyVotes, longThreshold, sellVotes, shortThreshold, TradeDirectionBias);
+   }
+
+   return(resolvedSignal);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: compute the T3/VWAP crossover signal with filters        |
+//+------------------------------------------------------------------+
+int ComputeT3VWAPSignal(const MqlRates &signalRates[])
+{
+   if(!UseT3VWAPFilter || !UseT3Indicator || !UseVWAPIndicator)
+      return(0);
+
+   int signal = 0;
+
+   bool bullishCross = (prevT3 < prevVWAPDaily && currT3 > currVWAPDaily);
+   bool bearishCross = (prevT3 > prevVWAPDaily && currT3 < currVWAPDaily);
+
+   bool bullishPriceConfirm = (signalRates[1].close > signalRates[1].open && signalRates[2].close > signalRates[2].open);
+   bool bearishPriceConfirm = (signalRates[1].close < signalRates[1].open && signalRates[2].close < signalRates[2].open);
+
+   if(bullishCross && bullishPriceConfirm)
+   {
+      bool passesFilters = true;
+
+      if(VWAP_Timeframe1 != VWAP_DISABLED && signalRates[1].close < currVWAPTF1)
+         passesFilters = false;
+      if(VWAP_Timeframe2 != VWAP_DISABLED && signalRates[1].close < currVWAPTF2)
+         passesFilters = false;
+      if(VWAP_Timeframe3 != VWAP_DISABLED && signalRates[1].close < currVWAPTF3)
+         passesFilters = false;
+      if(VWAP_Timeframe4 != VWAP_DISABLED && signalRates[1].close < currVWAPTF4)
+         passesFilters = false;
+      if(VWAP_Timeframe5 != VWAP_DISABLED && signalRates[1].close < currVWAPTF5)
+         passesFilters = false;
+      if(VWAP_Timeframe6 != VWAP_DISABLED && signalRates[1].close < currVWAPTF6)
+         passesFilters = false;
+      if(VWAP_Timeframe7 != VWAP_DISABLED && signalRates[1].close < currVWAPTF7)
+         passesFilters = false;
+      if(VWAP_Timeframe8 != VWAP_DISABLED && signalRates[1].close < currVWAPTF8)
+         passesFilters = false;
+
+      if(passesFilters)
+         signal = 1;
+   }
+   else if(bearishCross && bearishPriceConfirm)
+   {
+      bool passesFilters = true;
+
+      if(VWAP_Timeframe1 != VWAP_DISABLED && signalRates[1].close > currVWAPTF1)
+         passesFilters = false;
+      if(VWAP_Timeframe2 != VWAP_DISABLED && signalRates[1].close > currVWAPTF2)
+         passesFilters = false;
+      if(VWAP_Timeframe3 != VWAP_DISABLED && signalRates[1].close > currVWAPTF3)
+         passesFilters = false;
+      if(VWAP_Timeframe4 != VWAP_DISABLED && signalRates[1].close > currVWAPTF4)
+         passesFilters = false;
+      if(VWAP_Timeframe5 != VWAP_DISABLED && signalRates[1].close > currVWAPTF5)
+         passesFilters = false;
+      if(VWAP_Timeframe6 != VWAP_DISABLED && signalRates[1].close > currVWAPTF6)
+         passesFilters = false;
+      if(VWAP_Timeframe7 != VWAP_DISABLED && signalRates[1].close > currVWAPTF7)
+         passesFilters = false;
+      if(VWAP_Timeframe8 != VWAP_DISABLED && signalRates[1].close > currVWAPTF8)
+         passesFilters = false;
+
+      if(passesFilters)
+         signal = -1;
+   }
+
+   if(signal != 0 && allowVerboseLogs)
+   {
+      if(signal > 0)
+         Print("[Signals] T3/VWAP bullish crossover detected");
+      else
+         Print("[Signals] T3/VWAP bearish crossover detected");
+   }
+
+   return(signal);
 }
 
 //+------------------------------------------------------------------+
@@ -628,10 +1110,9 @@ void SafeCalculateVWAPOnBar(const MqlRates &rates[], int rates_count)
 //+------------------------------------------------------------------+
 void CheckForTradingSignals()
 {
-   // Only check for signals if automatic trading is enabled
-   if(!UseAutomaticTrading) return;
-   
-   // Get current price data
+   if(!UseAutomaticTrading)
+      return;
+
    MqlRates signalRates[];
    if(CopyRates(_Symbol, PERIOD_CURRENT, 0, SignalConfirmationBars + 2, signalRates) <= 0)
    {
@@ -639,91 +1120,77 @@ void CheckForTradingSignals()
       return;
    }
    ArraySetAsSeries(signalRates, true);
-   
-   // Initialize signal variables
-   bool buySignal = false;
-   bool sellSignal = false;
-   
-   // Check if we're already in a position with this magic number
+
    bool hasOpenPosition = false;
    for(int i = 0; i < PositionsTotal(); i++)
    {
-      if(PositionGetTicket(i) > 0)
+      if(PositionGetTicket(i) > 0 && PositionGetInteger(POSITION_MAGIC) == MagicNumber)
       {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber)
-         {
-            hasOpenPosition = true;
-            break;
-         }
+         hasOpenPosition = true;
+         break;
       }
    }
-   
-   // Only check for signals if we don't have an open position
-   if(!hasOpenPosition)
+
+   if(hasOpenPosition)
+      return;
+
+   const int MAX_MODULES = 10;
+   int moduleSignals[];
+   bool moduleEnabled[];
+   ArrayResize(moduleSignals, MAX_MODULES);
+   ArrayResize(moduleEnabled, MAX_MODULES);
+   int moduleCount = 0;
+
+   bool t3Enabled = (UseT3VWAPFilter && UseT3Indicator && UseVWAPIndicator);
+   int t3Signal = 0;
+   if(t3Enabled)
+      t3Signal = ComputeT3VWAPSignal(signalRates);
+   g_T3VWAPSignal = t3Signal;
+   moduleSignals[moduleCount] = t3Signal;
+   moduleEnabled[moduleCount] = t3Enabled;
+   moduleCount++;
+
+   moduleSignals[moduleCount] = g_EngulfingSignal;
+   moduleEnabled[moduleCount] = UseEngulfingPattern;
+   moduleCount++;
+
+   moduleSignals[moduleCount] = g_EngulfingStochSignal;
+   moduleEnabled[moduleCount] = (UseEngulfingStochastic && g_EngulfingStochReady);
+   moduleCount++;
+
+   moduleSignals[moduleCount] = g_QQESignal;
+   moduleEnabled[moduleCount] = (UseQQEIndicator && g_QQEReady);
+   moduleCount++;
+
+   moduleSignals[moduleCount] = g_SuperTrendSignal;
+   moduleEnabled[moduleCount] = (UseSuperTrendIndicator && g_SuperTrendReady);
+   moduleCount++;
+
+   moduleSignals[moduleCount] = g_FiboZigZagSignal;
+   moduleEnabled[moduleCount] = (UseFiboZigZagFilter && g_FiboZigZagReady);
+   moduleCount++;
+
+   moduleSignals[moduleCount] = g_IntrabarVolumeSignal;
+   moduleEnabled[moduleCount] = UseIntrabarVolumeFilter;
+   moduleCount++;
+
+   moduleSignals[moduleCount] = g_TotalPowerSignal;
+   moduleEnabled[moduleCount] = (UseTotalPowerFilter && g_TotalPowerReady);
+   moduleCount++;
+
+   int combinedSignal = CombineSignalVotes(moduleSignals, moduleEnabled, moduleCount);
+
+   if(combinedSignal > 0)
    {
-      // T3 crossing VWAP signal
-      if(UseT3Indicator && UseVWAPIndicator)
-      {
-         // Check for bullish crossing (T3 crosses above VWAP)
-         if(prevT3 < prevVWAPDaily && currT3 > currVWAPDaily)
-         {
-            // Confirm with price action
-            if(signalRates[1].close > signalRates[1].open && signalRates[2].close > signalRates[2].open)
-            {
-               buySignal = true;
-               Print("BUY Signal: T3 crossed above VWAP with bullish confirmation");
-               
-               // Apply additional VWAP timeframe filters if enabled
-               if(VWAP_Timeframe1 != VWAP_DISABLED && signalRates[1].close < currVWAPTF1)
-                  buySignal = false;
-                  
-               if(VWAP_Timeframe2 != VWAP_DISABLED && signalRates[1].close < currVWAPTF2)
-                  buySignal = false;
-                  
-               if(VWAP_Timeframe3 != VWAP_DISABLED && signalRates[1].close < currVWAPTF3)
-                  buySignal = false;
-                  
-               if(VWAP_Timeframe4 != VWAP_DISABLED && signalRates[1].close < currVWAPTF4)
-                  buySignal = false;
-            }
-         }
-         
-         // Check for bearish crossing (T3 crosses below VWAP)
-         else if(prevT3 > prevVWAPDaily && currT3 < currVWAPDaily)
-         {
-            // Confirm with price action
-            if(signalRates[1].close < signalRates[1].open && signalRates[2].close < signalRates[2].open)
-            {
-               sellSignal = true;
-               Print("SELL Signal: T3 crossed below VWAP with bearish confirmation");
-               
-               // Apply additional VWAP timeframe filters if enabled
-               if(VWAP_Timeframe1 != VWAP_DISABLED && signalRates[1].close > currVWAPTF1)
-                  sellSignal = false;
-                  
-               if(VWAP_Timeframe2 != VWAP_DISABLED && signalRates[1].close > currVWAPTF2)
-                  sellSignal = false;
-                  
-               if(VWAP_Timeframe3 != VWAP_DISABLED && signalRates[1].close > currVWAPTF3)
-                  sellSignal = false;
-                  
-               if(VWAP_Timeframe4 != VWAP_DISABLED && signalRates[1].close > currVWAPTF4)
-                  sellSignal = false;
-            }
-         }
-      }
-      
-      // Execute trade if signal is confirmed
-      if(buySignal)
-      {
-         Print("Executing BUY trade based on indicator signals");
-         ExecuteTrade(ORDER_TYPE_BUY);
-      }
-      else if(sellSignal)
-      {
-         Print("Executing SELL trade based on indicator signals");
-         ExecuteTrade(ORDER_TYPE_SELL);
-      }
+      if(allowVerboseLogs)
+         Print("Executing BUY trade based on combined signals");
+      ExecuteTrade(ORDER_TYPE_BUY);
+   }
+   else if(combinedSignal < 0)
+   {
+      if(allowVerboseLogs)
+         Print("Executing SELL trade based on combined signals");
+      ExecuteTrade(ORDER_TYPE_SELL);
    }
 }
 
@@ -735,12 +1202,14 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    // Check if this is a button click event
    if(id == CHARTEVENT_OBJECT_CLICK)
    {
-      Print("Button clicked: ", sparam);
+      if(allowVerboseLogs)
+         Print("Button clicked: ", sparam);
       
       // Check which button was clicked
       if(sparam == BuyButtonName)
       {
-         Print("Buy button clicked - executing BUY trade...");
+         if(allowVerboseLogs)
+            Print("Buy button clicked - executing BUY trade...");
          // Reset button state immediately to avoid double-clicks
          ObjectSetInteger(0, BuyButtonName, OBJPROP_STATE, false);
          ChartRedraw();
@@ -750,7 +1219,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       }
       else if(sparam == SellButtonName)
       {
-         Print("Sell button clicked - executing SELL trade...");
+         if(allowVerboseLogs)
+            Print("Sell button clicked - executing SELL trade...");
          // Reset button state immediately to avoid double-clicks
          ObjectSetInteger(0, SellButtonName, OBJPROP_STATE, false);
          ChartRedraw();
@@ -760,7 +1230,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       }
       else if(sparam == ButtonName) // ATR trailing activation button
       {
-         Print("ATR trailing button clicked");
+         if(allowVerboseLogs)
+            Print("ATR trailing button clicked");
          
          // Toggle manual trailing activation
          ManualTrailingActivated = !ManualTrailingActivated;
@@ -772,7 +1243,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
                         ManualTrailingActivated ? "Trailing Active" : "Start Trailing");
          
          // Print status message
-         Print(ManualTrailingActivated ? "Manual trailing activation enabled" : "Manual trailing activation disabled");
+         if(allowVerboseLogs)
+            Print(ManualTrailingActivated ? "Manual trailing activation enabled" : "Manual trailing activation disabled");
          
          ChartRedraw();
       }
@@ -823,28 +1295,28 @@ void CreateButton(string name, string text, int x, int y, color buttonColor)
 //+------------------------------------------------------------------+
 void ExecuteTrade(ENUM_ORDER_TYPE orderType)
 {
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("Starting trade execution for ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL", " order...");
    
    // Calculate stop loss distance based on ATR
    double stopLossDistance = GetStopLossDistance();
    if(stopLossDistance <= 0)
    {
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("ERROR: Could not calculate stop loss distance. Trade aborted.");
       return;
    }
    
    double stopLossPoints = stopLossDistance / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("Stop loss distance calculated: ", stopLossDistance, " (", stopLossPoints, " points)");
    
    // Get account equity and risk amount in account currency
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskAmount = equity * (currentRisk / 100.0);
    
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("Account equity: $", equity, ", Risk amount ($): ", riskAmount);
    
    // Get current price for order
@@ -869,11 +1341,11 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       else
          stopLossLevel = price + stopLossDistance;
       
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("WARNING: Stop distance adjusted to broker minimum: ", stopLossPoints, " points");
    }
    
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("Entry price: ", price, ", Stop loss level: ", stopLossLevel, " (", stopLossPoints, " points)");
    
    // DETERMINE ACCURATE POINT VALUE AND LOT SIZE
@@ -903,7 +1375,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       // Calculate money value of one point for our desired lot size
       double onePointPerLotValue = onePointValue; // Value of one point for 1.0 lot
       
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
       {
          Print("SYMBOL SPECIFICATIONS:");
          Print("- Contract Size: ", contractSize);
@@ -918,7 +1390,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       // Formula: lotSize = riskAmount / (stopLossPoints * onePointPerLotValue)
       lotSize = riskAmount / (stopLossPoints * onePointPerLotValue);
       
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("LOT SIZE CALCULATION: Risk $ ", riskAmount, 
               " / (", stopLossPoints, " points * $", onePointPerLotValue, " per point per 1.0 lot) = ", lotSize, " lots");
       
@@ -927,7 +1399,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
       double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
       
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("Symbol volume constraints - Min: ", minLot, ", Max: ", maxLot, ", Step: ", lotStep);
       
       // Round to the nearest lot step and apply constraints
@@ -939,7 +1411,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       double actualRiskAmount = lotSize * stopLossPoints * onePointPerLotValue;
       double actualRiskPercent = (actualRiskAmount / equity) * 100.0;
       
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
       {
          Print("Final lot size after adjustments: ", lotSize);
          Print("Actual risk with this lot size: $", actualRiskAmount, " (", actualRiskPercent, "% of account)");
@@ -947,7 +1419,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    }
    else
    {
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("Using fixed lot size: ", lotSize, " (AC Risk Management disabled)");
    }
    
@@ -963,7 +1435,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       double takeProfitPoints = stopLossPoints * riskToRewardRatio;
       takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
       {
          Print("TAKE PROFIT CALCULATION:");
          Print("  Stop loss distance: ", stopLossPoints, " points");
@@ -977,7 +1449,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       // Use a fixed R:R based on stop loss (default 3:1)
       double takeProfitPoints = stopLossPoints * AC_BaseReward;
       takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("Using fixed R:R ratio of 1:", AC_BaseReward);
    }
    
@@ -986,24 +1458,24 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    else
       takeProfitLevel = price - takeProfitDistance;
    
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("Take profit level: ", takeProfitLevel);
    
    // Set takeProfitLevel to 0 to disable automatic take profit if not using take profit
    if(!UseTakeProfit)
    {
       takeProfitLevel = 0;
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("Take profit disabled - manual close required");
    }
    else
    {
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("Automatic take profit enabled at level: ", takeProfitLevel);
    }
    
    // Execute the trade
-   if(!OptimizationMode || !isInBacktest)
+   if(allowVerboseLogs)
       Print("Executing trade: ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL", " ", lotSize, " lots @ ", price);
       
    trade.PositionOpen(_Symbol, orderType, lotSize, price, stopLossLevel, takeProfitLevel, TradeComment);
@@ -1011,7 +1483,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
    {
       ulong ticket = trade.ResultOrder();
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
       {
          Print("==== TRADE EXECUTED SUCCESSFULLY ====");
          Print("Order Type: ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL");
@@ -1031,12 +1503,12 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       }
       
       // DO NOT force enable trailing as requested by user
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("NOTE: Trailing stops are NOT automatically enabled - click the button to activate");
    }
    else
    {
-      if(!OptimizationMode || !isInBacktest)
+      if(allowVerboseLogs)
          Print("ERROR: Trade execution failed. Error code: ", trade.ResultRetcode(),
                ", Description: ", trade.ResultComment());
    }
@@ -1045,12 +1517,11 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
 //+------------------------------------------------------------------+
 //| Update trailing stops for all positions                          |
 //+------------------------------------------------------------------+
-void UpdateAllTrailingStops()
+void UpdateAllTrailingStops(bool newBar = false)
 {
-   // In optimization mode, only update trailing stops periodically
-   if(isInBacktest && OptimizationMode && lastBarTime != iTime(_Symbol, PERIOD_CURRENT, 0))
+   if(isInBacktest && !newBar && !ManualTrailingActivated)
       return;
-      
+  
    int total = PositionsTotal();
    for(int i = 0; i < total; i++)
    {
@@ -1165,7 +1636,6 @@ double OnTester()
    // In optimization mode, update the global variables for display
    if(MQLInfoInteger(MQL_OPTIMIZATION))
    {
-      // Set global variables for these metrics
       g_WinRate = customWinRate;
       g_WinTrades = customWinningTrades;
       g_LossTrades = customLosingTrades;
@@ -1175,40 +1645,8 @@ double OnTester()
       g_MaxConsecLoss = customMaxConsecLosers;
       g_AvgWinAmount = customAvgWinAmount;
       g_AvgLossAmount = customAvgLossAmount;
-      
-      // Skip file writing when running on MQL5 Cloud Network 
-      // This prevents "excessive use of disk space" errors
-      bool isLocalTesting = !MQLInfoInteger(MQL_TESTER_AGENT);
-      
-      // Only write to file if we're not on the MQL5 Cloud Network
-      if(isLocalTesting) 
-      {
-         // Write detailed stats to a CSV file that can be imported into external software
-         // Each pass in optimization writes a new line to the file
-         WriteOptimizationResults(
-            DoubleToString(T3_Length),           // T3 Length
-            DoubleToString(T3_Factor),           // T3 Factor
-            DoubleToString(AC_BaseRisk),         // Base Risk
-            DoubleToString(AC_BaseReward),       // Base Reward
-            DoubleToString(ATRPeriod),           // ATR Period
-            DoubleToString(ATRMultiplier),       // ATR Multiplier
-            DoubleToString(profit),              // Profit
-            DoubleToString(drawdown),            // Max Drawdown %
-            DoubleToString(profitFactor),        // Profit Factor
-            DoubleToString(trades),              // Total Trades
-            DoubleToString(customWinRate),       // Win Rate
-            DoubleToString(customWinningTrades), // Winning Trades
-            DoubleToString(customLosingTrades),  // Losing Trades
-            DoubleToString(customFinalBalance),  // Final Balance
-            DoubleToString(customAvgTradesDaily),// Avg Trades Daily
-            DoubleToString(customMaxConsecWinners), // Max Consec Winners
-            DoubleToString(customMaxConsecLosers),  // Max Consec Losers
-            DoubleToString(customAvgWinAmount),  // Avg Win Amount
-            DoubleToString(customAvgLossAmount)  // Avg Loss Amount
-         );
-      }
    }
-   
+
    // Return a custom metric for optimization
    // Using a combination of profit factor and recovery factor
    // with penalties for high drawdown
@@ -1225,79 +1663,6 @@ double OnTester()
       metric *= 1.2;
    
    return metric;
-}
-
-//+------------------------------------------------------------------+
-//| Write optimization results to a CSV file for external analysis    |
-//+------------------------------------------------------------------+
-void WriteOptimizationResults(
-   string t3Length,
-   string t3Factor,
-   string baseRisk,
-   string baseReward,
-   string atrPeriod,
-   string atrMultiplier,
-   string profit,
-   string drawdown,
-   string profitFactor,
-   string trades,
-   string winRate,
-   string winningTrades,
-   string losingTrades,
-   string finalBalance,
-   string avgTradesDaily,
-   string maxConsecWinners,
-   string maxConsecLosers,
-   string avgWinAmount,
-   string avgLossAmount
-)
-{
-   // Construct a unique filename based on the symbol and timeframe
-   string filename = "optimization_results_" + _Symbol + "_" + EnumToString((ENUM_TIMEFRAMES)Period()) + ".csv";
-   
-   // Check if file exists to determine if we need to write headers
-   bool fileExists = FileIsExist(filename, FILE_COMMON);
-   
-   // Open the file
-   int fileHandle = FileOpen(filename, FILE_WRITE|FILE_READ|FILE_CSV|FILE_COMMON, ",");
-   
-   if(fileHandle != INVALID_HANDLE)
-   {
-      // If file didn't exist, write the headers first
-      if(!fileExists)
-      {
-         FileSeek(fileHandle, 0, SEEK_END);
-         FileWrite(fileHandle, 
-            "T3_Length", "T3_Factor", "AC_BaseRisk", "AC_BaseReward", 
-            "ATRPeriod", "ATRMultiplier", "Profit", "Max_Drawdown", 
-            "Profit_Factor", "Total_Trades", "Win_Rate", "Winning_Trades", 
-            "Losing_Trades", "Final_Balance", "Avg_Trades_Daily", 
-            "Max_Consec_Winners", "Max_Consec_Losers", "Avg_Win_Amount", "Avg_Loss_Amount"
-         );
-      }
-      else
-      {
-         // If file exists, seek to the end to append data
-         FileSeek(fileHandle, 0, SEEK_END);
-      }
-      
-      // Write the data for this optimization pass
-      FileWrite(fileHandle, 
-         t3Length, t3Factor, baseRisk, baseReward, 
-         atrPeriod, atrMultiplier, profit, drawdown, 
-         profitFactor, trades, winRate, winningTrades, 
-         losingTrades, finalBalance, avgTradesDaily, 
-         maxConsecWinners, maxConsecLosers, avgWinAmount, avgLossAmount
-      );
-      
-      // Close the file
-      FileClose(fileHandle);
-   }
-   else
-   {
-      // If we couldn't open the file, just print a message (no need to interrupt optimization)
-      Print("Failed to write optimization results to file. Error: ", GetLastError());
-   }
 }
 
 //+------------------------------------------------------------------+
@@ -1339,5 +1704,3 @@ void PrintOptimizationMetrics(
    // Print to the log - this will appear in the Journal tab
    Print(stats);
 }
-
-
