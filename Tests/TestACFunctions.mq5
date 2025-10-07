@@ -13,6 +13,8 @@
 #include <Trade/Trade.mqh>
 #include "../Include/ACFunctions.mqh"
 
+CSymbolValidator g_SymbolValidator;
+
 // Input parameters for testing
 input group "==== Test Case Settings ===="
 input bool     EnableAutomatedTesting = true;  // Enable automated test cases
@@ -116,6 +118,13 @@ int OnInit()
     ArrayResize(rewardValues, maxGraphPoints);
     ArrayInitialize(riskValues, 0);
     ArrayInitialize(rewardValues, 0);
+
+    if(!g_SymbolValidator.Init(_Symbol))
+    {
+        Print("[TestACFunctions] Failed to initialise symbol validator.");
+        return(INIT_FAILED);
+    }
+    g_SymbolValidator.Refresh();
     
     // Save original equity for simulation purposes
     originalEquity = AccountInfoDouble(ACCOUNT_EQUITY);

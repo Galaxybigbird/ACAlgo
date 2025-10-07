@@ -5,12 +5,13 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023"
 #property link      ""
-#property version   "1.36"
+#property version   "1.38"
 #property strict
 #property description "Main trading EA with Asymmetrical Compounding Risk Management"
 
 // Include necessary libraries
 #include <Trade/Trade.mqh>
+#include <SymbolValidator.mqh>  // Symbol environment caching
 #include <ACFunctions.mqh>      // Position sizing and risk management
 #include <ATRtrailing.mqh>      // Trailing stop functionality
 // Include indicators as direct calculation libraries
@@ -80,15 +81,6 @@ input bool     UseACRiskManagement = true; // Enable AC risk management (false =
 // They will appear in the inputs dialog automatically
 // AC_BaseRisk, AC_BaseReward, AC_CompoundingWins, ATRPeriod, ATRMultiplier, MaxStopLossDistance
 
-//--- Button Settings
-input group "==== Button Settings ===="
-input int      BuyButtonX = 100;        // X position for Buy button
-input int      BuyButtonY = 40;         // Y position for Buy button
-input int      SellButtonX = 100;       // X position for Sell button
-input int      SellButtonY = 80;        // Y position for Sell button
-input color    BuyButtonColor = clrDodgerBlue;  // Color for Buy button
-input color    SellButtonColor = clrCrimson;    // Color for Sell button
-
 //--- T3 Indicator Settings
 input group "==== T3 Indicator Settings ===="
 input bool     UseT3Indicator = true;   // Use T3 indicator for entry signals
@@ -115,7 +107,6 @@ input bool     VWAP_UseTickPrecision = false; // Use tick-level precision for VW
 
 //--- Entry Signal Settings
 input group "==== Entry Signal Settings ===="
-input bool     UseAutomaticTrading = false; // Enable automatic trading based on indicators
 input int      SignalConfirmationBars = 2;  // Number of bars to confirm signal
 input int      MinSignalsToEnterLong = 1;     // Minimum aligned signals required for long entries
 input int      MinSignalsToEnterShort = 1;    // Minimum aligned signals required for short entries
@@ -202,8 +193,7 @@ double g_AvgLossAmount = 0;      // Average loss amount
 
 //--- Global Variables
 CTrade trade;                      // Trade object for executing trades
-string BuyButtonName = "BuyButton";  // Name for Buy button
-string SellButtonName = "SellButton"; // Name for Sell button
+CSymbolValidator g_SymbolValidator; // Cached symbol environment / validation helper
 
 // Indicator instances
 CT3Indicator T3;                // T3 indicator instance
@@ -307,56 +297,15 @@ int OnInit()
    isInBacktest = isOptimizationPass || isTesterPass;
    isFastModeContext = isInBacktest && (OptimizationMode || isForwardTest);
    allowVerboseLogs = !isFastModeContext;
-   
-   // Clear existing objects from the chart first (except indicators)
-   if(allowVerboseLogs)
+
+   if(!g_SymbolValidator.Init(_Symbol))
    {
-      Print("Clearing chart objects before initializing EA...");
-      
-      // Delete objects by their specific type using manual iteration
-      // Delete all buttons
-      for(int i = ObjectsTotal(0, 0, OBJ_BUTTON) - 1; i >= 0; i--)
-      {
-          ObjectDelete(0, ObjectName(0, i, 0, OBJ_BUTTON));
-      }
-      
-      // Delete all labels
-      for(int i = ObjectsTotal(0, 0, OBJ_LABEL) - 1; i >= 0; i--)
-      {
-          ObjectDelete(0, ObjectName(0, i, 0, OBJ_LABEL));
-      }
-      
-      // Delete all horizontal lines
-      for(int i = ObjectsTotal(0, 0, OBJ_HLINE) - 1; i >= 0; i--)
-      {
-          ObjectDelete(0, ObjectName(0, i, 0, OBJ_HLINE));
-      }
-      
-      // Delete objects by pattern that could be left from previous runs
-      int totalObjects = ObjectsTotal(0);
-      for(int i = totalObjects - 1; i >= 0; i--)
-      {
-          string objName = ObjectName(0, i);
-          
-          // Check if this is one of our objects by specific patterns
-          if(StringFind(objName, "ATR") >= 0 || 
-             StringFind(objName, "Trail") >= 0 || 
-             StringFind(objName, "Button") >= 0 ||
-             StringFind(objName, "Test") >= 0 || 
-             StringFind(objName, "Buy") >= 0 || 
-             StringFind(objName, "Sell") >= 0 || 
-             StringFind(objName, "SL") >= 0 || 
-             StringFind(objName, "Close") >= 0 || 
-             StringFind(objName, "Level") >= 0 || 
-             StringFind(objName, "Label") >= 0)
-          {
-              ObjectDelete(0, objName);
-          }
-      }
-      
-      // Force a chart redraw to ensure all objects are removed visually
-      ChartRedraw();
+      Print("ERROR: Failed to initialise symbol environment for ", _Symbol);
+      return(INIT_FAILED);
    }
+
+   g_SymbolValidator.Refresh();
+   g_SymbolValidator.CheckHistory(MathMax(200, SignalConfirmationBars + 10));
    
    // Initialize the trade object
    trade.SetDeviationInPoints(Slippage);
@@ -546,13 +495,6 @@ int OnInit()
          Print("[Init] Total Power Indicator failed to initialise - signal disabled.");
    }
    
-   // Create buttons for manual trading only when not in backtest mode
-   if(!isInBacktest)
-   {
-      CreateButton(BuyButtonName, "BUY", BuyButtonX, BuyButtonY, BuyButtonColor);
-      CreateButton(SellButtonName, "SELL", SellButtonX, SellButtonY, SellButtonColor);
-   }
-   
    if(allowVerboseLogs)
    {
       Print("=================================");
@@ -571,7 +513,6 @@ int OnInit()
       Print("✓ Fibo ZigZag filter: ", (UseFiboZigZagFilter && g_FiboZigZagReady) ? "Enabled" : "Disabled");
       Print("✓ Intrabar volume filter: ", UseIntrabarVolumeFilter ? "Enabled" : "Disabled");
       Print("✓ Total Power filter: ", (UseTotalPowerFilter && g_TotalPowerReady) ? "Enabled" : "Disabled");
-      Print("✓ Automatic trading: ", UseAutomaticTrading ? "Enabled" : "Disabled");
       Print("✓ Optimization Mode: ", OptimizationMode ? "Enabled" : "Disabled");
       Print("=================================");
    }
@@ -604,36 +545,8 @@ void OnDeinit(const int reason)
       }
    }
 
-   // More aggressive cleanup of ALL objects to ensure no leftovers
-   if(allowVerboseLogs)
-      Print("Performing complete cleanup of all EA objects...");
-   
-   // Clean up specific named buttons
-   ObjectDelete(0, BuyButtonName);
-   ObjectDelete(0, SellButtonName);
-   ObjectDelete(0, ButtonName); // ATR trailing button
-   
-   // Clean up ALL buttons on the chart
-   for(int i = ObjectsTotal(0, 0, OBJ_BUTTON) - 1; i >= 0; i--)
-   {
-       ObjectDelete(0, ObjectName(0, i, 0, OBJ_BUTTON));
-   }
-   
-   // Clean up ALL labels and lines
-   for(int i = ObjectsTotal(0, 0, OBJ_LABEL) - 1; i >= 0; i--)
-   {
-       ObjectDelete(0, ObjectName(0, i, 0, OBJ_LABEL));
-   }
-   
-   for(int i = ObjectsTotal(0, 0, OBJ_HLINE) - 1; i >= 0; i--)
-   {
-       ObjectDelete(0, ObjectName(0, i, 0, OBJ_HLINE));
-   }
-   
-   // Clean up ATR trailing objects
-   CleanupATRTrailing();
-
    // Release aux indicator resources
+   CleanupATRTrailing();
    EngulfingStochSignal.Shutdown();
    QQESignal.Shutdown();
    SuperTrendSignal.Shutdown();
@@ -644,11 +557,8 @@ void OnDeinit(const int reason)
     g_TotalPowerReady = false;
     g_TotalPowerSignal = 0;
    
-   // Force chart redraw to ensure all objects are cleared visually
-   ChartRedraw();
-   
    if(allowVerboseLogs)
-      Print("MainACAlgorithm EA removed - all objects cleaned up");
+      Print("MainACAlgorithm EA removed - runtime resources released");
 }
 
 //+------------------------------------------------------------------+
@@ -656,6 +566,8 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   g_SymbolValidator.Refresh();
+
    // Only update trailing stops when necessary
    if(isFastModeContext)
    {
@@ -682,9 +594,8 @@ void OnTick()
       lastBarTime = currentBarTime;
       UpdateIndicators();
    
-      // Check for trading signals if automatic trading is enabled
-      if(UseAutomaticTrading)
-         CheckForTradingSignals();
+      // Check for trading signals on every new bar
+      CheckForTradingSignals();
    }
 }
 
@@ -846,11 +757,6 @@ void UpdateIndicators()
       }
    }
    
-   // We've disabled visualization, but keeping this for compatibility
-   // The condition will always be false since we set ShowATRLevels=false in OnInit
-   if(ShowATRLevels && !isInBacktest)
-      UpdateVisualization();
-
    // Update auxiliary signals after core indicators are refreshed
    if(UseEngulfingPattern)
       g_EngulfingSignal = EngulfingDetector.Evaluate(priceRates, ratesCount);
@@ -1110,9 +1016,6 @@ int ComputeT3VWAPSignal(const MqlRates &signalRates[])
 //+------------------------------------------------------------------+
 void CheckForTradingSignals()
 {
-   if(!UseAutomaticTrading)
-      return;
-
    MqlRates signalRates[];
    if(CopyRates(_Symbol, PERIOD_CURRENT, 0, SignalConfirmationBars + 2, signalRates) <= 0)
    {
@@ -1197,99 +1100,6 @@ void CheckForTradingSignals()
 //+------------------------------------------------------------------+
 //| ChartEvent function - Handle button clicks                       |
 //+------------------------------------------------------------------+
-void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
-{
-   // Check if this is a button click event
-   if(id == CHARTEVENT_OBJECT_CLICK)
-   {
-      if(allowVerboseLogs)
-         Print("Button clicked: ", sparam);
-      
-      // Check which button was clicked
-      if(sparam == BuyButtonName)
-      {
-         if(allowVerboseLogs)
-            Print("Buy button clicked - executing BUY trade...");
-         // Reset button state immediately to avoid double-clicks
-         ObjectSetInteger(0, BuyButtonName, OBJPROP_STATE, false);
-         ChartRedraw();
-         
-         // Execute BUY trade
-         ExecuteTrade(ORDER_TYPE_BUY);
-      }
-      else if(sparam == SellButtonName)
-      {
-         if(allowVerboseLogs)
-            Print("Sell button clicked - executing SELL trade...");
-         // Reset button state immediately to avoid double-clicks
-         ObjectSetInteger(0, SellButtonName, OBJPROP_STATE, false);
-         ChartRedraw();
-         
-         // Execute SELL trade
-         ExecuteTrade(ORDER_TYPE_SELL);
-      }
-      else if(sparam == ButtonName) // ATR trailing activation button
-      {
-         if(allowVerboseLogs)
-            Print("ATR trailing button clicked");
-         
-         // Toggle manual trailing activation
-         ManualTrailingActivated = !ManualTrailingActivated;
-         
-         // Update button color and text based on state
-         ObjectSetInteger(0, ButtonName, OBJPROP_COLOR, 
-                         ManualTrailingActivated ? ButtonColorActive : ButtonColorInactive);
-         ObjectSetString(0, ButtonName, OBJPROP_TEXT, 
-                        ManualTrailingActivated ? "Trailing Active" : "Start Trailing");
-         
-         // Print status message
-         if(allowVerboseLogs)
-            Print(ManualTrailingActivated ? "Manual trailing activation enabled" : "Manual trailing activation disabled");
-         
-         ChartRedraw();
-      }
-   }
-}
-
-//+------------------------------------------------------------------+
-//| Create a button on the chart                                     |
-//+------------------------------------------------------------------+
-void CreateButton(string name, string text, int x, int y, color buttonColor)
-{
-   // Delete any existing button with the same name to avoid conflicts
-   ObjectDelete(0, name);
-   
-   // Create the button
-   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
-   {
-      Print("Error: failed to create button ", name, ". Error code: ", GetLastError());
-      return;
-   }
-   
-   // Configure button properties
-   ObjectSetInteger(0, name, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
-   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
-   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
-   ObjectSetInteger(0, name, OBJPROP_XSIZE, 80);
-   ObjectSetInteger(0, name, OBJPROP_YSIZE, 30);
-   ObjectSetString(0, name, OBJPROP_TEXT, text);
-   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
-   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, buttonColor);
-   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrBlack);
-   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 10);
-   ObjectSetInteger(0, name, OBJPROP_STATE, false);
-   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);  // Make buttons not selectable
-   ObjectSetInteger(0, name, OBJPROP_HIDDEN, false);      // Make buttons visible
-   ObjectSetInteger(0, name, OBJPROP_ZORDER, 1);          // Put buttons on top
-   ObjectSetInteger(0, name, OBJPROP_BACK, false);        // Not in the background
-   
-   // Log successful button creation
-   Print("Button ", name, " created successfully");
-   
-   // Force chart redraw to ensure button appears
-   ChartRedraw();
-}
-
 //+------------------------------------------------------------------+
 //| Execute a trade with proper risk management                       |
 //+------------------------------------------------------------------+
@@ -1307,7 +1117,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       return;
    }
    
-   double stopLossPoints = stopLossDistance / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double stopLossPoints = stopLossDistance / g_SymbolValidator.Point();
    
    if(allowVerboseLogs)
       Print("Stop loss distance calculated: ", stopLossDistance, " (", stopLossPoints, " points)");
@@ -1320,7 +1130,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       Print("Account equity: $", equity, ", Risk amount ($): ", riskAmount);
    
    // Get current price for order
-   double price = SymbolInfoDouble(_Symbol, orderType == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
+   double price = (orderType == ORDER_TYPE_BUY) ? g_SymbolValidator.Ask() : g_SymbolValidator.Bid();
    
    // Calculate stop loss level based on order type
    double stopLossLevel = (orderType == ORDER_TYPE_BUY) ? 
@@ -1328,13 +1138,13 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
                           price + stopLossDistance;
    
    // Get the minimum allowed stop distance from the broker
-   double minStopLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopLevel = g_SymbolValidator.StopsLevel();
    
    // Ensure our stop is at least the minimum distance required by broker
    if(stopLossPoints < minStopLevel)
    {
-      stopLossDistance = minStopLevel * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      stopLossPoints = stopLossDistance / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      stopLossDistance = minStopLevel * g_SymbolValidator.Point();
+      stopLossPoints = stopLossDistance / g_SymbolValidator.Point();
       
       if(orderType == ORDER_TYPE_BUY)
          stopLossLevel = price - stopLossDistance;
@@ -1358,13 +1168,13 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       // We use a practical approach: calculate the exact money value of a 1-lot position with 1-point stop
       double testLot = 1.0; // Use 1.0 lot for calculation
       double testPointDistance = 1.0; // 1 point distance
-      double testPriceMovement = testPointDistance * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double testPriceMovement = testPointDistance * g_SymbolValidator.Point();
       
       // Get contract specifications
-      double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
-      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-      double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      double contractSize = g_SymbolValidator.ContractSize();
+      double tickValue = g_SymbolValidator.TickValue();
+      double tickSize = g_SymbolValidator.TickSize();
+      double pointSize = g_SymbolValidator.Point();
       
       // Calculate how many ticks are in one point
       double ticksPerPoint = pointSize / tickSize;
@@ -1395,9 +1205,9 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
               " / (", stopLossPoints, " points * $", onePointPerLotValue, " per point per 1.0 lot) = ", lotSize, " lots");
       
       // Get symbol volume constraints for validation
-      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-      double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-      double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+      double minLot = g_SymbolValidator.MinLot();
+      double maxLot = g_SymbolValidator.MaxLot();
+      double lotStep = g_SymbolValidator.LotStep();
       
       if(allowVerboseLogs)
          Print("Symbol volume constraints - Min: ", minLot, ", Max: ", maxLot, ", Step: ", lotStep);
@@ -1433,7 +1243,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       double riskToRewardRatio = currentReward / currentRisk;
       // Calculate take profit points based on the R:R ratio
       double takeProfitPoints = stopLossPoints * riskToRewardRatio;
-      takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      takeProfitDistance = takeProfitPoints * g_SymbolValidator.Point();
       
       if(allowVerboseLogs)
       {
@@ -1448,7 +1258,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    {
       // Use a fixed R:R based on stop loss (default 3:1)
       double takeProfitPoints = stopLossPoints * AC_BaseReward;
-      takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+      takeProfitDistance = takeProfitPoints * g_SymbolValidator.Point();
       if(allowVerboseLogs)
          Print("Using fixed R:R ratio of 1:", AC_BaseReward);
    }
@@ -1470,10 +1280,49 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    }
    else
    {
-      if(allowVerboseLogs)
-         Print("Automatic take profit enabled at level: ", takeProfitLevel);
+   if(allowVerboseLogs)
+      Print("Automatic take profit enabled at level: ", takeProfitLevel);
    }
    
+   lotSize = g_SymbolValidator.ValidateVolume(orderType, lotSize);
+   if(lotSize <= 0.0)
+   {
+      if(allowVerboseLogs)
+         Print("ERROR: Lot size invalid after broker validation. Trade aborted.");
+      return;
+   }
+
+   if(!g_SymbolValidator.CheckMarginForVolume(orderType, lotSize, price))
+   {
+      if(allowVerboseLogs)
+         Print("ERROR: Insufficient margin for lot size ", lotSize, ". Trade aborted.");
+      return;
+   }
+
+   double validatedSL = g_SymbolValidator.ValidateStopLoss(orderType, price, stopLossLevel);
+   if(validatedSL <= 0.0)
+   {
+      if(allowVerboseLogs)
+         Print("ERROR: Stop loss validation failed. Trade aborted.");
+      return;
+   }
+   stopLossLevel = validatedSL;
+
+   if(UseTakeProfit && takeProfitLevel > 0.0)
+   {
+      double validatedTP = g_SymbolValidator.ValidateTakeProfit(orderType, price, takeProfitLevel);
+      if(validatedTP <= 0.0)
+      {
+         if(allowVerboseLogs)
+            Print("WARNING: Take profit validation failed. Disabling take profit for this trade.");
+         takeProfitLevel = 0.0;
+      }
+      else
+      {
+         takeProfitLevel = validatedTP;
+      }
+   }
+
    // Execute the trade
    if(allowVerboseLogs)
       Print("Executing trade: ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL", " ", lotSize, " lots @ ", price);
@@ -1492,7 +1341,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
          Print("Stop Loss: ", stopLossLevel, " (", stopLossPoints, " points)");
          
          if(UseTakeProfit)
-            Print("Take Profit: ", takeProfitLevel, " (", takeProfitDistance / SymbolInfoDouble(_Symbol, SYMBOL_POINT), " points)");
+            Print("Take Profit: ", takeProfitLevel, " (", takeProfitDistance / g_SymbolValidator.Point(), " points)");
          else
             Print("Take Profit: DISABLED - close manually when desired");
             
@@ -1504,7 +1353,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       
       // DO NOT force enable trailing as requested by user
       if(allowVerboseLogs)
-         Print("NOTE: Trailing stops are NOT automatically enabled - click the button to activate");
+         Print("NOTE: Trailing stops respect the UseATRTrailing input; adjust that setting to change behaviour.");
    }
    else
    {

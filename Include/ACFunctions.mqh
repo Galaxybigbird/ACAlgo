@@ -3,6 +3,8 @@
 //|                Function Library for MT5                          |
 //+------------------------------------------------------------------+
 
+#include <SymbolValidator.mqh>
+
 // Risk management input parameters
 input group "==== AC Risk Management Parameters ===="
 input double AC_BaseRisk_Input = 1.0;          // Base risk percentage per trade
@@ -297,7 +299,7 @@ double GetStopLossDistance()
 {
    // Calculate ATR from past candles
    double atr = CalculateATR();
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double point = g_SymbolValidator.Point();
    
    // MODIFIED: Apply an expansion factor to the ATR multiplier to make stops wider
    // Original formula: ATR * multiplier
@@ -334,9 +336,9 @@ double GetStopLossDistance()
 bool VerifyRiskCalculation(double equity, double volume, double stopLossPoints, double targetRiskPercent)
 {
     // Get accurate point value calculation directly from symbol properties
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
-    double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double tickValue = g_SymbolValidator.TickValue();
+    double tickSize = g_SymbolValidator.TickSize();
+    double pointSize = g_SymbolValidator.Point();
     
     // Calculate how many ticks are in one point
     double ticksPerPoint = pointSize / tickSize;
@@ -392,12 +394,12 @@ double GetAdjustedStopLossDistance(double originalStopLossDistance, double volum
       equity = gSavedEquity;
    }
    
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double point = g_SymbolValidator.Point();
    double stopLossPoints = originalStopLossDistance / point;
    
    // Get standard MT5 contract specifications using improved point value calculation
-   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = g_SymbolValidator.TickValue();
+   double tickSize = g_SymbolValidator.TickSize();
    
    // Calculate how many ticks are in one point
    double ticksPerPoint = point / tickSize;
@@ -507,13 +509,13 @@ double CalculateLotSize(double stopLossDistance)
     }
     
     // Get symbol specifications - IMPROVED with detailed calculations from MainACAlgorithm.mq5
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double point = g_SymbolValidator.Point();
     double stopLossInPoints = stopLossDistance / point;
     
     // Get contract specifications
-    double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double contractSize = g_SymbolValidator.ContractSize();
+    double tickValue = g_SymbolValidator.TickValue();
+    double tickSize = g_SymbolValidator.TickSize();
     
     // Calculate how many ticks are in one point
     double ticksPerPoint = point / tickSize;
@@ -535,9 +537,9 @@ double CalculateLotSize(double stopLossDistance)
     double positionSize = riskAmount / (stopLossInPoints * onePointValue);
     
     // Get lot constraints for the symbol
-    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = g_SymbolValidator.LotStep();
+    double minLot = g_SymbolValidator.MinLot();
+    double maxLot = g_SymbolValidator.MaxLot();
     
     // FIXED: Round DOWN to the nearest lot step to ensure we don't exceed risk
     int steps = (int)MathFloor(positionSize / lotStep);
@@ -646,7 +648,7 @@ bool OptimizeRiskParameters(double &volume, double &stopLossDistance)
         equity = gSavedEquity;
     }
     
-    double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+    double point = g_SymbolValidator.Point();
     double stopLossPoints = stopLossDistance / point;
     
     // IMPROVED: Enforce minimum stop loss distance
@@ -668,8 +670,8 @@ bool OptimizeRiskParameters(double &volume, double &stopLossDistance)
     }
     
     // Get standard MT5 contract specifications using improved point value calculation
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double tickValue = g_SymbolValidator.TickValue();
+    double tickSize = g_SymbolValidator.TickSize();
     
     // Calculate how many ticks are in one point
     double ticksPerPoint = point / tickSize;
@@ -678,9 +680,9 @@ bool OptimizeRiskParameters(double &volume, double &stopLossDistance)
     double onePointValue = tickValue * ticksPerPoint;
     
     // Get lot constraints for the symbol
-    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
-    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double lotStep = g_SymbolValidator.LotStep();
+    double minLot = g_SymbolValidator.MinLot();
+    double maxLot = g_SymbolValidator.MaxLot();
     
     // Calculate point cost using the accurate point value
     double pointCost = onePointValue * volume;

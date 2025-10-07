@@ -7,6 +7,8 @@
 #include <Trade/Trade.mqh> // Include the Trade library
 #include "../Include/ATRtrailing.mqh" // Include the ATRtrailing library
 
+CSymbolValidator g_SymbolValidator;
+
 // Input parameters for testing
 input group    "==== Test Parameters ===="
 input bool     EnableAutomatedTesting = true;  // Enable automated test cases
@@ -74,6 +76,13 @@ datetime lastTestTime = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
+    if(!g_SymbolValidator.Init(_Symbol))
+    {
+        Print("[TestATRTrailing] Failed to initialise symbol validator.");
+        return(INIT_FAILED);
+    }
+    g_SymbolValidator.Refresh();
+
     // Clear all existing objects from the chart first
     Print("Clearing chart objects before initializing EA...");
     

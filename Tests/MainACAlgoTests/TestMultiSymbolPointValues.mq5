@@ -10,6 +10,8 @@
 // Include necessary libraries
 #include "c:/Users/marth/AppData/Roaming/MetaQuotes/Terminal/E62C655ED163FFC555DD40DBEA67E6BB/MQL5/Experts/MainACAlgo/Include/ACFunctions.mqh"
 
+CSymbolValidator g_SymbolValidator;
+
 // Global test settings
 double testEquity = 10000.0;   // Default test account size
 int totalTests = 0;
@@ -21,6 +23,9 @@ string testedSymbols[];        // Will be populated with available symbols
 //+------------------------------------------------------------------+
 int OnInit()
 {
+   g_SymbolValidator.Init(_Symbol);
+   g_SymbolValidator.Refresh();
+
    // Force specific settings for testing
    gSavedEquity = testEquity;
    

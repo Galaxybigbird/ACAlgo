@@ -8,27 +8,21 @@
 #property version   "1.01"
 #property strict
 
+#include <SymbolValidator.mqh>
+
 // Input parameters for DEMA-ATR trailing stop
 input group    "==== DEMA-ATR Trailing ====";
 input int      DEMA_ATR_Period = 14;       // Period for DEMA-ATR calculation
 input double   DEMA_ATR_Multiplier = 1.5;  // ATR trailing distance multiplier
 input double   TrailingActivationPercent = 1.0; // Activate trailing at this profit %
 input bool     UseATRTrailing = true;      // Enable DEMA-ATR trailing stop
-input int      TrailingButtonXDistance = 120; // X distance for trailing button position
-input int      TrailingButtonYDistance = 20;  // Y distance for trailing button position
-
-input group    "==== Visualization Settings ====";
-input bool     ShowATRLevels = true;       // Show ATR levels on chart
-input color    BuyLevelColor = clrDodgerBlue;  // Color for buy levels
-input color    SellLevelColor = clrCrimson;    // Color for sell levels
-input bool     ShowStatistics = true;      // Show statistics on chart
 input double   MinimumStopDistance = 400.0; // Minimum stop distance in points
 
-// Global variables for button and manual activation
-string         ButtonName = "StartTrailing";  // Unique name for the button
+// Retained constant name for compatibility with legacy modules/tests
+string         ButtonName = "StartTrailing";
+
+// Manual activation flag (legacy toggle kept for compatibility with helper functions)
 bool           ManualTrailingActivated = false;  // Flag for manual trailing activation
-color          ButtonColorActive = clrLime;     // Button color when trailing is active
-color          ButtonColorInactive = clrGray;   // Button color when trailing is inactive
 
 // Buffers for DEMA ATR calculation
 double AtrDEMA[], Ema1[], Ema2[];  // buffers for DEMA ATR, and intermediate EMAs
@@ -48,7 +42,7 @@ double BestCaseProfit = 0;
 //+------------------------------------------------------------------+
 void CleanupATRTrailing()
 {
-    // Print final statistics
+    // Print final statistics when available
     if(SuccessfulTrailingUpdates > 0 || FailedTrailingUpdates > 0)
     {
         Print("=== ATR Trailing Summary ===");
@@ -64,57 +58,9 @@ void CleanupATRTrailing()
         }
         Print("==========================");
     }
-    
-    // Delete the trailing button
-    ObjectDelete(0, ButtonName);
-    
-    // Clear all visualization
+
+    // No chart objects to manage - visual output removed for tester compatibility
     ClearVisualization();
-    
-    // Delete ALL objects with our name prefixes to ensure complete cleanup
-    int totalObjects = ObjectsTotal(0);
-    for(int i = totalObjects - 1; i >= 0; i--)
-    {
-        string objName = ObjectName(0, i);
-        
-        // Check if this is one of our objects using more comprehensive criteria
-        if(StringFind(objName, "ATR") >= 0 || 
-           StringFind(objName, "Trailing") >= 0 ||
-           StringFind(objName, "DEMA") >= 0 ||
-           StringFind(objName, "Trail") >= 0 || 
-           StringFind(objName, "SL") >= 0 || 
-           StringFind(objName, "Test") >= 0 || 
-           StringFind(objName, "Vol") >= 0 || 
-           StringFind(objName, "Buy") >= 0 || 
-           StringFind(objName, "Sell") >= 0 || 
-           StringFind(objName, "Level") >= 0 || 
-           StringFind(objName, "Label") >= 0 || 
-           StringFind(objName, "Msg") >= 0 ||
-           StringFind(objName, "Button") >= 0)
-        {
-            ObjectDelete(0, objName);
-        }
-    }
-    
-    // Also delete all test-specific objects and labels
-    for(int i = 0; i <= 100; i++)
-    {
-        ObjectDelete(0, "TestLabel" + IntegerToString(i));
-        ObjectDelete(0, "Test_" + IntegerToString(i));
-        ObjectDelete(0, "TestResult" + IntegerToString(i));
-    }
-    
-    // Clean all buttons
-    for(int i = 0; i < ObjectsTotal(0); i++)
-    {
-        string objName = ObjectName(0, i);
-        if(ObjectGetInteger(0, objName, OBJPROP_TYPE) == OBJ_BUTTON)
-        {
-            ObjectDelete(0, objName);
-        }
-    }
-    
-    ChartRedraw();
 }
 
 //+------------------------------------------------------------------+
@@ -134,23 +80,8 @@ void InitDEMAATR()
     ArrayInitialize(Ema1, 0);
     ArrayInitialize(Ema2, 0);
     
-    // Create the Start Trailing button in top-right corner
-    ObjectCreate(0, ButtonName, OBJ_BUTTON, 0, 0, 0);
-    ObjectSetInteger(0, ButtonName, OBJPROP_CORNER, CORNER_RIGHT_UPPER);
-    ObjectSetInteger(0, ButtonName, OBJPROP_XDISTANCE, TrailingButtonXDistance);
-    ObjectSetInteger(0, ButtonName, OBJPROP_YDISTANCE, TrailingButtonYDistance);
-    ObjectSetInteger(0, ButtonName, OBJPROP_XSIZE, 100);
-    ObjectSetInteger(0, ButtonName, OBJPROP_YSIZE, 20);
-    ObjectSetString(0, ButtonName, OBJPROP_TEXT, "Start Trailing");
-    ObjectSetInteger(0, ButtonName, OBJPROP_COLOR, ButtonColorInactive);
-    ObjectSetInteger(0, ButtonName, OBJPROP_BGCOLOR, clrWhite);
-    ObjectSetInteger(0, ButtonName, OBJPROP_BORDER_COLOR, clrBlack);
-    ObjectSetInteger(0, ButtonName, OBJPROP_FONTSIZE, 10);
-    
     // Reset statistics
     ResetTrailingStats();
-    
-    ChartRedraw();
 }
 
 //+------------------------------------------------------------------+
@@ -250,9 +181,9 @@ bool ShouldActivateTrailing(double entryPrice, double currentPrice, string order
     
     // Calculate profit metrics
     double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-    double pointValue = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+    double pointValue = g_SymbolValidator.Point();
+    double tickValue = g_SymbolValidator.TickValue();
+    double tickSize = g_SymbolValidator.TickSize();
     double pipValue = tickValue * (pointValue / tickSize);
     
     // Calculate profit in account currency
@@ -523,105 +454,7 @@ bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
 //+------------------------------------------------------------------+
 void UpdateVisualization()
 {
-    // Force return immediately, regardless of ShowATRLevels
-    return; // Added this line to completely disable visualization
-    
-    if(!ShowATRLevels) return;
-    
-    // Clear previous objects
-    ClearVisualization();
-    
-    // Draw current ATR trailing stop levels
-    double atrValue = CalculateDEMAATR();
-    double trailingDistance = MathMax(atrValue * CurrentATRMultiplier, MinimumStopDistance * Point());
-    
-    double buyTrailingLevel = SymbolInfoDouble(_Symbol, SYMBOL_BID) - trailingDistance;
-    double sellTrailingLevel = SymbolInfoDouble(_Symbol, SYMBOL_ASK) + trailingDistance;
-    
-    // Create objects for trailing levels
-    string buyLevelName = "BuyTrailingLevel";
-    string sellLevelName = "SellTrailingLevel";
-    
-    // Buy trailing level (blue horizontal line)
-    ObjectCreate(0, buyLevelName, OBJ_HLINE, 0, 0, buyTrailingLevel);
-    ObjectSetInteger(0, buyLevelName, OBJPROP_COLOR, BuyLevelColor);
-    ObjectSetInteger(0, buyLevelName, OBJPROP_STYLE, STYLE_DASH);
-    ObjectSetInteger(0, buyLevelName, OBJPROP_WIDTH, 1);
-    ObjectSetString(0, buyLevelName, OBJPROP_TOOLTIP, "Buy Trailing Level: " + DoubleToString(buyTrailingLevel, _Digits));
-    
-    // Sell trailing level (red horizontal line)
-    ObjectCreate(0, sellLevelName, OBJ_HLINE, 0, 0, sellTrailingLevel);
-    ObjectSetInteger(0, sellLevelName, OBJPROP_COLOR, SellLevelColor);
-    ObjectSetInteger(0, sellLevelName, OBJPROP_STYLE, STYLE_DASH);
-    ObjectSetInteger(0, sellLevelName, OBJPROP_WIDTH, 1);
-    ObjectSetString(0, sellLevelName, OBJPROP_TOOLTIP, "Sell Trailing Level: " + DoubleToString(sellTrailingLevel, _Digits));
-    
-    // Draw current ATR value as a label
-    string atrLabelName = "ATRValueLabel";
-    ObjectCreate(0, atrLabelName, OBJ_LABEL, 0, 0, 0);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_XDISTANCE, 150);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_YDISTANCE, 30);
-    ObjectSetString(0, atrLabelName, OBJPROP_TEXT, "ATR: " + DoubleToString(atrValue, 5) + 
-                   " | Distance: " + DoubleToString(trailingDistance, 5) + 
-                   " | Multi: " + DoubleToString(CurrentATRMultiplier, 1) + "x");
-    ObjectSetInteger(0, atrLabelName, OBJPROP_COLOR, clrWhite);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_BGCOLOR, clrDarkSlateGray);
-    ObjectSetInteger(0, atrLabelName, OBJPROP_FONTSIZE, 9);
-    
-    // Draw statistics if enabled
-    if(ShowStatistics)
-    {
-        string statsLabelName = "StatsLabel";
-        ObjectCreate(0, statsLabelName, OBJ_LABEL, 0, 0, 0);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_CORNER, CORNER_RIGHT_LOWER);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_XDISTANCE, 150);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_YDISTANCE, 60);
-        
-        string statsText = "Updates: " + IntegerToString(SuccessfulTrailingUpdates) + 
-                         " | Fails: " + IntegerToString(FailedTrailingUpdates);
-                         
-        // Calculate success rate if we have updates
-        if(SuccessfulTrailingUpdates > 0 || FailedTrailingUpdates > 0)
-        {
-            double successRate = 100.0 * SuccessfulTrailingUpdates / (SuccessfulTrailingUpdates + FailedTrailingUpdates);
-            statsText += " | Rate: " + DoubleToString(successRate, 1) + "%";
-        }
-                         
-        ObjectSetString(0, statsLabelName, OBJPROP_TEXT, statsText);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_COLOR, clrWhite);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_BGCOLOR, clrDarkSlateBlue);
-        ObjectSetInteger(0, statsLabelName, OBJPROP_FONTSIZE, 9);
-    }
-    
-    // If we have an open position, mark the active trailing stop level
-    int totalPositions = PositionsTotal();
-    for(int i = 0; i < totalPositions; i++)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket > 0 && PositionGetString(POSITION_SYMBOL) == _Symbol)
-        {
-            double currentSL = PositionGetDouble(POSITION_SL);
-            if(currentSL > 0)
-            {
-                string slLineName = "CurrentSL" + IntegerToString(ticket);
-                ObjectCreate(0, slLineName, OBJ_HLINE, 0, 0, currentSL);
-                
-                // Different colors for different positions
-                color slColor = (i == 0) ? clrGold : 
-                              (i == 1) ? clrLightGoldenrod : 
-                              (i == 2) ? clrPaleGoldenrod : clrGold;
-                              
-                ObjectSetInteger(0, slLineName, OBJPROP_COLOR, slColor);
-                ObjectSetInteger(0, slLineName, OBJPROP_STYLE, STYLE_SOLID);
-                ObjectSetInteger(0, slLineName, OBJPROP_WIDTH, 2);
-                ObjectSetString(0, slLineName, OBJPROP_TOOLTIP, "Active SL [" + IntegerToString(ticket) + "]: " + 
-                                DoubleToString(currentSL, _Digits));
-            }
-        }
-    }
-    
-    ChartRedraw();
+    // Visualization removed for tester compatibility
 }
 
 //+------------------------------------------------------------------+
@@ -629,42 +462,7 @@ void UpdateVisualization()
 //+------------------------------------------------------------------+
 void ClearVisualization()
 {
-    // Basic visualization objects
-    ObjectDelete(0, "BuyTrailingLevel");
-    ObjectDelete(0, "SellTrailingLevel");
-    ObjectDelete(0, "ATRValueLabel");
-    ObjectDelete(0, "StatsLabel");
-    
-    // Delete all SL lines for positions
-    for(int i = 0; i < 100; i++) // Increased to handle more positions
-    {
-        ObjectDelete(0, "CurrentSL" + IntegerToString(i));
-    }
-    
-    // Delete any position-specific SL lines based on ticket
-    for(int i = 0; i < PositionsTotal(); i++)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(ticket > 0)
-        {
-            ObjectDelete(0, "CurrentSL" + IntegerToString(ticket));
-        }
-    }
-    
-    // Delete all visualization text labels
-    for(int i = 0; i < ObjectsTotal(0); i++)
-    {
-        string objName = ObjectName(0, i);
-        if(StringFind(objName, "Level") >= 0 || 
-           StringFind(objName, "Label") >= 0 || 
-           StringFind(objName, "ATR") >= 0 ||
-           StringFind(objName, "SL") >= 0)
-        {
-            ObjectDelete(0, objName);
-        }
-    }
-    
-    ChartRedraw();
+    // Visualization removed for tester compatibility
 }
 
 //+------------------------------------------------------------------+
@@ -691,8 +489,7 @@ void SetATRParameters(double atrMultiplier, int atrPeriod)
     Print("ATR Parameters updated - Multiplier: ", atrMultiplier, ", Period: ", atrPeriod);
     
     // Update visualization if enabled
-    if(ShowATRLevels)
-        UpdateVisualization();
+    UpdateVisualization();
 }
 
 //+------------------------------------------------------------------+
