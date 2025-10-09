@@ -24,6 +24,10 @@ string         ButtonName = "StartTrailing";
 // Manual activation flag (legacy toggle kept for compatibility with helper functions)
 bool           ManualTrailingActivated = false;  // Flag for manual trailing activation
 
+// Visual feedback colours for the manual trailing button
+const color    ButtonColorActive   = clrLimeGreen;
+const color    ButtonColorInactive = clrDimGray;
+
 // Buffers for DEMA ATR calculation
 double AtrDEMA[], Ema1[], Ema2[];  // buffers for DEMA ATR, and intermediate EMAs
 

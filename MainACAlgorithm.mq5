@@ -5,13 +5,12 @@
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023"
 #property link      ""
-#property version   "1.38"
+#property version   "1.42"
 #property strict
 #property description "Main trading EA with Asymmetrical Compounding Risk Management"
 
 // Include necessary libraries
 #include <Trade/Trade.mqh>
-#include <SymbolValidator.mqh>  // Symbol environment caching
 #include <ACFunctions.mqh>      // Position sizing and risk management
 #include <ATRtrailing.mqh>      // Trailing stop functionality
 // Include indicators as direct calculation libraries
@@ -24,6 +23,8 @@
 #include <FiboZigZag.mqh>             // Fibonacci ZigZag detection
 #include <IntrabarVolume.mqh>         // Intrabar volume filter
 #include <TotalPowerIndicator.mqh>    // Total power indicator filter
+
+CSymbolValidator g_SymbolValidator;   // Shared symbol environment helper
 
 // Custom enum for VWAP timeframes with DISABLED option
 enum ENUM_VWAP_TIMEFRAMES
@@ -55,9 +56,9 @@ enum ENUM_VWAP_TIMEFRAMES
 // Trade direction bias control
 enum ENUM_TRADE_BIAS
 {
-   BIAS_LONG_AND_SHORT = 0,   // Allow both long and short trades
-   BIAS_LONG_ONLY      = 1,   // Only permit long entries
-   BIAS_SHORT_ONLY     = 2    // Only permit short entries
+   Both      = 0,   // Both
+   LongOnly  = 1,   // LongOnly
+   ShortOnly = 2    // ShortOnly
 };
 
 //--- Performance Optimization Settings
@@ -76,6 +77,10 @@ input bool     UseTakeProfit = true;   // Enable TP at reward?
 //--- Risk Management Settings
 input group "==== Risk Management Settings ===="
 input bool     UseACRiskManagement = true; // Enable AC risk management (false = use fixed lot size)
+
+//--- Stop Tightening Settings
+input group "==== Stop Tightening Settings ===="
+input int      MaxHoldBars = 0;            // Max bars of ATR range to allow for initial stop (0 = disabled)
 
 // Note: AC risk parameters are defined in ACFunctions.mqh
 // They will appear in the inputs dialog automatically
@@ -111,7 +116,7 @@ input int      SignalConfirmationBars = 2;  // Number of bars to confirm signal
 input int      MinSignalsToEnterLong = 1;     // Minimum aligned signals required for long entries
 input int      MinSignalsToEnterShort = 1;    // Minimum aligned signals required for short entries
 input int      MinSignalsToEnterBoth = 1;     // Minimum aligned signals when both directions allowed
-input ENUM_TRADE_BIAS TradeDirectionBias = BIAS_LONG_AND_SHORT; // Directional bias filter
+input ENUM_TRADE_BIAS TradeDirectionBias = Both; // Directional bias filter
 
 //--- Engulfing Pattern Settings
 input group "==== Engulfing Pattern Settings ===="
@@ -193,8 +198,6 @@ double g_AvgLossAmount = 0;      // Average loss amount
 
 //--- Global Variables
 CTrade trade;                      // Trade object for executing trades
-CSymbolValidator g_SymbolValidator; // Cached symbol environment / validation helper
-
 // Indicator instances
 CT3Indicator T3;                // T3 indicator instance
 CVWAPIndicator VWAP;            // VWAP indicator instance
@@ -297,15 +300,6 @@ int OnInit()
    isInBacktest = isOptimizationPass || isTesterPass;
    isFastModeContext = isInBacktest && (OptimizationMode || isForwardTest);
    allowVerboseLogs = !isFastModeContext;
-
-   if(!g_SymbolValidator.Init(_Symbol))
-   {
-      Print("ERROR: Failed to initialise symbol environment for ", _Symbol);
-      return(INIT_FAILED);
-   }
-
-   g_SymbolValidator.Refresh();
-   g_SymbolValidator.CheckHistory(MathMax(200, SignalConfirmationBars + 10));
    
    // Initialize the trade object
    trade.SetDeviationInPoints(Slippage);
@@ -513,6 +507,7 @@ int OnInit()
       Print("✓ Fibo ZigZag filter: ", (UseFiboZigZagFilter && g_FiboZigZagReady) ? "Enabled" : "Disabled");
       Print("✓ Intrabar volume filter: ", UseIntrabarVolumeFilter ? "Enabled" : "Disabled");
       Print("✓ Total Power filter: ", (UseTotalPowerFilter && g_TotalPowerReady) ? "Enabled" : "Disabled");
+      Print("✓ MaxHoldBars clamp: ", MaxHoldBars > 0 ? StringFormat("%d bars", MaxHoldBars) : "Disabled");
       Print("✓ Optimization Mode: ", OptimizationMode ? "Enabled" : "Disabled");
       Print("=================================");
    }
@@ -545,8 +540,10 @@ void OnDeinit(const int reason)
       }
    }
 
-   // Release aux indicator resources
+   // Release ATR trailing resources
    CleanupATRTrailing();
+
+   // Release aux indicator resources
    EngulfingStochSignal.Shutdown();
    QQESignal.Shutdown();
    SuperTrendSignal.Shutdown();
@@ -554,11 +551,11 @@ void OnDeinit(const int reason)
    g_FiboZigZagReady = false;
    g_FiboZigZagSignal = 0;
    TotalPowerSignal.Shutdown();
-    g_TotalPowerReady = false;
-    g_TotalPowerSignal = 0;
+   g_TotalPowerReady = false;
+   g_TotalPowerSignal = 0;
    
    if(allowVerboseLogs)
-      Print("MainACAlgorithm EA removed - runtime resources released");
+      Print("MainACAlgorithm EA removed - resources released");
 }
 
 //+------------------------------------------------------------------+
@@ -566,8 +563,6 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   g_SymbolValidator.Refresh();
-
    // Only update trailing stops when necessary
    if(isFastModeContext)
    {
@@ -594,7 +589,7 @@ void OnTick()
       lastBarTime = currentBarTime;
       UpdateIndicators();
    
-      // Check for trading signals on every new bar
+      // Evaluate strategy signals each new bar
       CheckForTradingSignals();
    }
 }
@@ -903,13 +898,13 @@ int CombineSignalVotes(const int &signals[], const bool &enabled[], const int mo
    int resolvedSignal = 0;
 
    // Determine applicable thresholds based on bias configuration
-   bool allowLongs  = (TradeDirectionBias != BIAS_SHORT_ONLY);
-   bool allowShorts = (TradeDirectionBias != BIAS_LONG_ONLY);
+   bool allowLongs  = (TradeDirectionBias != ShortOnly);
+   bool allowShorts = (TradeDirectionBias != LongOnly);
 
-   int longThreshold  = MathMax(1, (TradeDirectionBias == BIAS_LONG_ONLY)
+   int longThreshold  = MathMax(1, (TradeDirectionBias == LongOnly)
                                    ? MinSignalsToEnterLong
                                    : MinSignalsToEnterBoth);
-   int shortThreshold = MathMax(1, (TradeDirectionBias == BIAS_SHORT_ONLY)
+   int shortThreshold = MathMax(1, (TradeDirectionBias == ShortOnly)
                                    ? MinSignalsToEnterShort
                                    : MinSignalsToEnterBoth);
 
@@ -1098,9 +1093,6 @@ void CheckForTradingSignals()
 }
 
 //+------------------------------------------------------------------+
-//| ChartEvent function - Handle button clicks                       |
-//+------------------------------------------------------------------+
-//+------------------------------------------------------------------+
 //| Execute a trade with proper risk management                       |
 //+------------------------------------------------------------------+
 void ExecuteTrade(ENUM_ORDER_TYPE orderType)
@@ -1117,7 +1109,8 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       return;
    }
    
-   double stopLossPoints = stopLossDistance / g_SymbolValidator.Point();
+   double symbolPoint = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double stopLossPoints = (symbolPoint > 0.0) ? stopLossDistance / symbolPoint : 0.0;
    
    if(allowVerboseLogs)
       Print("Stop loss distance calculated: ", stopLossDistance, " (", stopLossPoints, " points)");
@@ -1130,7 +1123,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       Print("Account equity: $", equity, ", Risk amount ($): ", riskAmount);
    
    // Get current price for order
-   double price = (orderType == ORDER_TYPE_BUY) ? g_SymbolValidator.Ask() : g_SymbolValidator.Bid();
+   double price = SymbolInfoDouble(_Symbol, orderType == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
    
    // Calculate stop loss level based on order type
    double stopLossLevel = (orderType == ORDER_TYPE_BUY) ? 
@@ -1138,21 +1131,87 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
                           price + stopLossDistance;
    
    // Get the minimum allowed stop distance from the broker
-   double minStopLevel = g_SymbolValidator.StopsLevel();
+   double minStopLevel = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
    
    // Ensure our stop is at least the minimum distance required by broker
-   if(stopLossPoints < minStopLevel)
+   if(stopLossPoints < minStopLevel && symbolPoint > 0.0)
    {
-      stopLossDistance = minStopLevel * g_SymbolValidator.Point();
-      stopLossPoints = stopLossDistance / g_SymbolValidator.Point();
-      
+      stopLossDistance = minStopLevel * symbolPoint;
+      stopLossPoints = stopLossDistance / symbolPoint;
+
       if(orderType == ORDER_TYPE_BUY)
          stopLossLevel = price - stopLossDistance;
       else
          stopLossLevel = price + stopLossDistance;
-      
+
       if(allowVerboseLogs)
          Print("WARNING: Stop distance adjusted to broker minimum: ", stopLossPoints, " points");
+   }
+
+   // Apply MaxHoldBars/MaxStopLossDistance clamp before sizing the trade
+   double minStopDistanceAbs = (symbolPoint > 0.0) ? MathMax(symbolPoint, minStopLevel * symbolPoint) : 0.0;
+   double trailingMinAbs = MinimumStopDistance * symbolPoint;
+   if(trailingMinAbs > minStopDistanceAbs)
+      minStopDistanceAbs = trailingMinAbs;
+
+   double maxStopDistanceFromTime = (MaxStopLossDistance > 0.0 && symbolPoint > 0.0)
+                                    ? MaxStopLossDistance * symbolPoint
+                                    : 0.0;
+
+   if(MaxHoldBars > 0 && symbolPoint > 0.0)
+   {
+      double atr = iATR(_Symbol, PERIOD_CURRENT, ATRPeriod);
+      if(atr > 0.0)
+      {
+         double averageBarRangePoints = atr / symbolPoint;
+         double candidateDistancePoints = averageBarRangePoints * MaxHoldBars;
+         double candidateDistanceAbs = candidateDistancePoints * symbolPoint;
+         if(candidateDistanceAbs > 0.0 &&
+            (maxStopDistanceFromTime <= 0.0 || candidateDistanceAbs < maxStopDistanceFromTime))
+         {
+            maxStopDistanceFromTime = candidateDistanceAbs;
+         }
+      }
+   }
+
+   if(maxStopDistanceFromTime > 0.0)
+   {
+      if(minStopDistanceAbs > 0.0 && maxStopDistanceFromTime < minStopDistanceAbs)
+         maxStopDistanceFromTime = minStopDistanceAbs;
+
+      if(stopLossDistance > maxStopDistanceFromTime + 1e-8)
+      {
+         stopLossDistance = maxStopDistanceFromTime;
+         stopLossPoints = stopLossDistance / symbolPoint;
+         stopLossLevel = (orderType == ORDER_TYPE_BUY) ?
+                         price - stopLossDistance :
+                         price + stopLossDistance;
+
+         if(allowVerboseLogs)
+         {
+            PrintFormat("Stop distance clamped to %.2f points using MaxHoldBars/MaxStopLossDistance", stopLossPoints);
+         }
+      }
+   }
+
+   // Align stop distance with tick size if possible
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize > 0.0 && stopLossDistance >= tickSize)
+   {
+      double ticks = MathFloor(stopLossDistance / tickSize);
+      if(ticks < 1.0)
+         ticks = 1.0;
+      double alignedDistance = ticks * tickSize;
+      if(alignedDistance < minStopDistanceAbs && minStopDistanceAbs > 0.0)
+         alignedDistance = minStopDistanceAbs;
+      if(alignedDistance > 0.0)
+      {
+         stopLossDistance = alignedDistance;
+         stopLossPoints = (symbolPoint > 0.0) ? stopLossDistance / symbolPoint : stopLossPoints;
+         stopLossLevel = (orderType == ORDER_TYPE_BUY)
+                         ? price - stopLossDistance
+                         : price + stopLossDistance;
+      }
    }
    
    if(allowVerboseLogs)
@@ -1168,13 +1227,13 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       // We use a practical approach: calculate the exact money value of a 1-lot position with 1-point stop
       double testLot = 1.0; // Use 1.0 lot for calculation
       double testPointDistance = 1.0; // 1 point distance
-      double testPriceMovement = testPointDistance * g_SymbolValidator.Point();
+      double testPriceMovement = testPointDistance * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       
       // Get contract specifications
-      double contractSize = g_SymbolValidator.ContractSize();
-      double tickValue = g_SymbolValidator.TickValue();
-      double tickSize = g_SymbolValidator.TickSize();
-      double pointSize = g_SymbolValidator.Point();
+      double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
+      double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       
       // Calculate how many ticks are in one point
       double ticksPerPoint = pointSize / tickSize;
@@ -1205,9 +1264,9 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
               " / (", stopLossPoints, " points * $", onePointPerLotValue, " per point per 1.0 lot) = ", lotSize, " lots");
       
       // Get symbol volume constraints for validation
-      double minLot = g_SymbolValidator.MinLot();
-      double maxLot = g_SymbolValidator.MaxLot();
-      double lotStep = g_SymbolValidator.LotStep();
+      double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+      double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+      double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
       
       if(allowVerboseLogs)
          Print("Symbol volume constraints - Min: ", minLot, ", Max: ", maxLot, ", Step: ", lotStep);
@@ -1243,7 +1302,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       double riskToRewardRatio = currentReward / currentRisk;
       // Calculate take profit points based on the R:R ratio
       double takeProfitPoints = stopLossPoints * riskToRewardRatio;
-      takeProfitDistance = takeProfitPoints * g_SymbolValidator.Point();
+      takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       
       if(allowVerboseLogs)
       {
@@ -1258,7 +1317,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    {
       // Use a fixed R:R based on stop loss (default 3:1)
       double takeProfitPoints = stopLossPoints * AC_BaseReward;
-      takeProfitDistance = takeProfitPoints * g_SymbolValidator.Point();
+      takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       if(allowVerboseLogs)
          Print("Using fixed R:R ratio of 1:", AC_BaseReward);
    }
@@ -1280,49 +1339,10 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    }
    else
    {
-   if(allowVerboseLogs)
-      Print("Automatic take profit enabled at level: ", takeProfitLevel);
+      if(allowVerboseLogs)
+         Print("Automatic take profit enabled at level: ", takeProfitLevel);
    }
    
-   lotSize = g_SymbolValidator.ValidateVolume(orderType, lotSize);
-   if(lotSize <= 0.0)
-   {
-      if(allowVerboseLogs)
-         Print("ERROR: Lot size invalid after broker validation. Trade aborted.");
-      return;
-   }
-
-   if(!g_SymbolValidator.CheckMarginForVolume(orderType, lotSize, price))
-   {
-      if(allowVerboseLogs)
-         Print("ERROR: Insufficient margin for lot size ", lotSize, ". Trade aborted.");
-      return;
-   }
-
-   double validatedSL = g_SymbolValidator.ValidateStopLoss(orderType, price, stopLossLevel);
-   if(validatedSL <= 0.0)
-   {
-      if(allowVerboseLogs)
-         Print("ERROR: Stop loss validation failed. Trade aborted.");
-      return;
-   }
-   stopLossLevel = validatedSL;
-
-   if(UseTakeProfit && takeProfitLevel > 0.0)
-   {
-      double validatedTP = g_SymbolValidator.ValidateTakeProfit(orderType, price, takeProfitLevel);
-      if(validatedTP <= 0.0)
-      {
-         if(allowVerboseLogs)
-            Print("WARNING: Take profit validation failed. Disabling take profit for this trade.");
-         takeProfitLevel = 0.0;
-      }
-      else
-      {
-         takeProfitLevel = validatedTP;
-      }
-   }
-
    // Execute the trade
    if(allowVerboseLogs)
       Print("Executing trade: ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL", " ", lotSize, " lots @ ", price);
@@ -1341,7 +1361,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
          Print("Stop Loss: ", stopLossLevel, " (", stopLossPoints, " points)");
          
          if(UseTakeProfit)
-            Print("Take Profit: ", takeProfitLevel, " (", takeProfitDistance / g_SymbolValidator.Point(), " points)");
+            Print("Take Profit: ", takeProfitLevel, " (", takeProfitDistance / SymbolInfoDouble(_Symbol, SYMBOL_POINT), " points)");
          else
             Print("Take Profit: DISABLED - close manually when desired");
             
@@ -1353,7 +1373,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       
       // DO NOT force enable trailing as requested by user
       if(allowVerboseLogs)
-         Print("NOTE: Trailing stops respect the UseATRTrailing input; adjust that setting to change behaviour.");
+         Print("NOTE: Trailing stops respect the UseATRTrailing setting; enable it to activate trailing management.");
    }
    else
    {

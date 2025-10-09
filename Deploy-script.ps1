@@ -53,6 +53,8 @@ try {
         'OldStableMainACAlgo.mq5',
         'ACBreakRevertPro.mq5',
         'BreakRevertPro.mq5',
+        'ACMultiSymbolAlgorithm.mq5',
+        'DifferentEAs/ACMultiSACBreakRevertPro.mq5',
         'BreakRevertPro.ex5',
         'test.mq5',
         'test.ex5'
