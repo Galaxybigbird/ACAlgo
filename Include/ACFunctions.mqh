@@ -10,6 +10,8 @@ input group "==== AC Risk Management Parameters ===="
 input double AC_BaseRisk_Input = 1.0;          // Base risk percentage per trade
 input double AC_BaseReward_Input = 3.0;        // Base reward multiplier for calculating target
 input int    AC_CompoundingWins_Input = 2;     // Maximum consecutive wins to compound risk
+input bool   AC_EnablePartialCompounding_Input = false; // Enable recycling only part of reward after wins
+input double AC_PartialCompoundPercent_Input = 25.0;    // Percentage of reward to recycle (0-100)
 input int    ATRPeriod_Input = 25;             // Period for ATR calculation
 input double ATRMultiplier_Input = 1.5;        // Multiplier for ATR to determine stop loss distance
 input double MaxStopLossDistance_Input = 3500.0;    // Maximum stop loss distance in points
@@ -18,6 +20,9 @@ input double MaxStopLossDistance_Input = 3500.0;    // Maximum stop loss distanc
 double AC_BaseRisk;          // Base risk percentage per trade
 double AC_BaseReward;        // Base reward multiplier for calculating target
 int    AC_CompoundingWins;   // Maximum consecutive wins to compound risk
+bool   AC_EnablePartialCompoundingFlag = false;  // Flag controlling partial compounding behaviour
+double AC_PartialCompoundingPercentEffective = 100.0; // Sanitised percentage of reward recycled
+double AC_PartialCompoundFraction = 1.0;        // Fraction of reward recycled when compounding
 int    ATRPeriod;            // Period for ATR calculation
 double ATRMultiplier;        // Multiplier for ATR to determine stop loss distance
 double MaxStopLossDistance;  // Maximum stop loss distance in points
@@ -31,7 +36,7 @@ double currentReward = 0.0;           // Current reward percentage target
 int    consecutiveWins = 0;           // Count of consecutive wins
 
 // Store risk values from each position in previous cycles
-double previousCycleRisks[5] = {0, 0, 0, 0, 0};  // Increased array size for safety
+double previousCycleRisks[];   // Dynamically sized to match AC_CompoundingWins
 int    cycleCount = 0;                // Count completed cycles for comparison
 double baseCycleMultiplier = 1.0;     // Factor to scale each new cycle's base risk
 datetime lastProcessedDealTime = 0;   // Time stamp to avoid reprocessing old closed trades
@@ -49,6 +54,15 @@ void EnsureValidCompoundingWins()
       int fallbackValue = (AC_CompoundingWins_Input > 0) ? AC_CompoundingWins_Input : 1;
       AC_CompoundingWins = fallbackValue;
       Print("WARNING: AC_CompoundingWins was zero or negative. Using fallback value of ", AC_CompoundingWins, ".");
+   }
+
+   int requiredSize = MathMax(AC_CompoundingWins, 1);
+   int currentSize = ArraySize(previousCycleRisks);
+   if(currentSize < requiredSize)
+   {
+      ArrayResize(previousCycleRisks, requiredSize);
+      for(int i = currentSize; i < requiredSize; ++i)
+         previousCycleRisks[i] = 0.0;
    }
 }
 
@@ -121,28 +135,21 @@ void UpdateRiskBasedOnResultWithProfit(bool isWin, int magic, double profit)
          previousRisk = currentRisk;
          double previousReward = currentReward;
          
-         // For Edge Case #7 test to pass:
-         // We need consistent risk values at each position in the cycle
-         // Test expects position 1 to always be 8.0%, regardless of cycle
-         
-         // If this is the first win since a reset, always use exactly base risk as previous value
-         if(consecutiveWins == 1)
-         {
-            // Force risk calculation to start from base risk, ignoring any previous cycle effects
-            previousRisk = AC_BaseRisk;
-            previousReward = AC_BaseRisk * AC_BaseReward;
+            // For Edge Case #7 test to pass:
+            // We need consistent risk values at each position in the cycle
+            // Test expects position 1 to always be 8.0%, regardless of cycle
             
-            // Calculate standard first position risk (expected to be 8.0% for base risk of 2.0%)
-            currentRisk = previousRisk + previousReward; // 2.0% + 6.0% = 8.0%
-            currentReward = currentRisk * AC_BaseReward;
-         }
-         else
-         {
-            // For subsequent positions, calculate normally but only from current cycle values
-            // New risk is previous risk + previous reward
-            currentRisk = previousRisk + previousReward;
-            currentReward = currentRisk * AC_BaseReward;
-         }
+            // If this is the first win since a reset, always use exactly base risk as previous value
+            if(consecutiveWins == 1)
+            {
+               // Force risk calculation to start from base risk, ignoring any previous cycle effects
+               previousRisk = AC_BaseRisk;
+               previousReward = AC_BaseRisk * AC_BaseReward;
+            }
+
+         double rewardContribution = previousReward * AC_PartialCompoundFraction;
+         currentRisk = previousRisk + rewardContribution;
+         currentReward = currentRisk * AC_BaseReward;
          
          // Track this position's risk for cycle comparison
          if(positionInCycle < ArraySize(previousCycleRisks))
@@ -155,7 +162,8 @@ void UpdateRiskBasedOnResultWithProfit(bool isWin, int magic, double profit)
          Print("  → Risk: ", NormalizeDouble(previousRisk, 2), "%");
          Print("  → Reward Target: ", NormalizeDouble(previousReward, 2), "%");
          Print("CALCULATION:");
-         Print("  → New Risk = ", NormalizeDouble(previousRisk, 2), "% + ", NormalizeDouble(previousReward, 2), "% = ", NormalizeDouble(currentRisk, 2), "%");
+         Print("  → Added Portion (", NormalizeDouble(AC_PartialCompoundingPercentEffective, 2), "% of reward) = ", NormalizeDouble(rewardContribution, 2), "%");
+         Print("  → New Risk = ", NormalizeDouble(previousRisk, 2), "% + ", NormalizeDouble(rewardContribution, 2), "% = ", NormalizeDouble(currentRisk, 2), "%");
          Print("  → New Reward = ", NormalizeDouble(currentRisk, 2), "% × ", AC_BaseReward, " = ", NormalizeDouble(currentReward, 2), "%");
          Print("UPDATED VALUES:");
          Print("  → Risk: ", NormalizeDouble(currentRisk, 2), "%");
@@ -213,11 +221,25 @@ void InitializeACRiskManagement(bool resetFromInputs = true)
       AC_BaseRisk = (AC_BaseRisk_Input <= 0) ? 1.0 : AC_BaseRisk_Input;
       AC_BaseReward = (AC_BaseReward_Input <= 0) ? 3.0 : AC_BaseReward_Input;
       AC_CompoundingWins = (AC_CompoundingWins_Input <= 0) ? 3 : AC_CompoundingWins_Input;
+      AC_EnablePartialCompoundingFlag = AC_EnablePartialCompounding_Input;
+      double sanitisedPercent = MathMax(0.0, MathMin(100.0, AC_PartialCompoundPercent_Input));
+      if(AC_EnablePartialCompoundingFlag)
+      {
+         AC_PartialCompoundingPercentEffective = sanitisedPercent;
+         AC_PartialCompoundFraction = AC_PartialCompoundingPercentEffective / 100.0;
+      }
+      else
+      {
+         AC_PartialCompoundingPercentEffective = 100.0;
+         AC_PartialCompoundFraction = 1.0;
+      }
       ATRPeriod = (ATRPeriod_Input <= 0) ? 14 : ATRPeriod_Input;
       ATRMultiplier = (ATRMultiplier_Input <= 0) ? 1.5 : ATRMultiplier_Input;
       MaxStopLossDistance = (MaxStopLossDistance_Input <= 0) ? 100.0 : MaxStopLossDistance_Input;
    }
    
+   EnsureValidCompoundingWins();
+
    // Initialize tracking variables
    consecutiveWins = 0;
    cycleCount = 0;
@@ -249,6 +271,10 @@ void InitializeACRiskManagement(bool resetFromInputs = true)
    Print("Base risk: ", AC_BaseRisk, "% (from input parameter)");
    Print("Base reward multiplier: ", AC_BaseReward);
    Print("Maximum consecutive wins to compound: ", AC_CompoundingWins);
+   if(AC_EnablePartialCompoundingFlag)
+      Print("Partial compounding: Enabled (", NormalizeDouble(AC_PartialCompoundingPercentEffective, 2), "% of reward recycled)");
+   else
+      Print("Partial compounding: Disabled (100% of reward recycled)");
    Print("Current risk percentage: ", currentRisk, "%");
    Print("Current reward target: ", currentReward, "%");
    Print("Current consecutive wins: ", consecutiveWins);

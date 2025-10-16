@@ -16,6 +16,7 @@ input int      DEMA_ATR_Period = 14;       // Period for DEMA-ATR calculation
 input double   DEMA_ATR_Multiplier = 1.5;  // ATR trailing distance multiplier
 input double   TrailingActivationPercent = 1.0; // Activate trailing at this profit %
 input bool     UseATRTrailing = true;      // Enable DEMA-ATR trailing stop
+input bool     UseTrailingOnCompoundedTrades = false; // Allow trailing on compounded trades when main toggle is off
 input double   MinimumStopDistance = 400.0; // Minimum stop distance in points
 
 // Retained constant name for compatibility with legacy modules/tests
@@ -40,6 +41,52 @@ int SuccessfulTrailingUpdates = 0;
 int FailedTrailingUpdates = 0;
 double WorstCaseSlippage = 0;
 double BestCaseProfit = 0;
+
+//+------------------------------------------------------------------+
+//| Helper: detect whether a trade comment marks a compounded trade  |
+//+------------------------------------------------------------------+
+bool CommentIndicatesCompounding(const string comment)
+{
+    if(StringLen(comment) == 0)
+        return false;
+
+    // Trade comments follow the pattern "AC|C#/#|RR#" for compounded stages
+    return (StringFind(comment, "AC|C") == 0);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: determine if trailing is allowed for the position        |
+//+------------------------------------------------------------------+
+bool TrailingAllowedForPosition(const string positionComment)
+{
+    if(ManualTrailingActivated)
+        return true;
+
+    if(UseATRTrailing)
+        return true;
+
+    if(!UseTrailingOnCompoundedTrades)
+        return false;
+
+    return CommentIndicatesCompounding(positionComment);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: detect compounded override activation                    |
+//+------------------------------------------------------------------+
+bool IsCompoundedTrailingOverride(const string positionComment)
+{
+    if(ManualTrailingActivated)
+        return false;
+
+    if(UseATRTrailing)
+        return false;
+
+    if(!UseTrailingOnCompoundedTrades)
+        return false;
+
+    return CommentIndicatesCompounding(positionComment);
+}
 
 //+------------------------------------------------------------------+
 //| Clean up all objects when EA is removed                           |
@@ -176,19 +223,35 @@ double CalculateDEMAATR(int period = 0)
 //+------------------------------------------------------------------+
 //| Check if trailing stop should be activated                       |
 //+------------------------------------------------------------------+
-bool ShouldActivateTrailing(double entryPrice, double currentPrice, string orderType, double volume)
+bool ShouldActivateTrailing(double entryPrice, double currentPrice, string orderType, double volume, bool compoundedOverride = false)
 {
-    if(!UseATRTrailing) return false;
+    // Manual override always activates trailing regardless of settings
+    if(ManualTrailingActivated)
+        return true;
+
+    bool trailingEnabled = UseATRTrailing || compoundedOverride;
+    if(!trailingEnabled)
+        return false;
     
-    // Check if manual activation is enabled
-    if(ManualTrailingActivated) return true;
+    static double lastTrackedEntryPrice = 0.0;
+    static bool activationLogged = false;
     
     // Calculate profit metrics
     double accountBalance = AccountInfoDouble(ACCOUNT_BALANCE);
     double pointValue = g_SymbolValidator.Point();
     double tickValue = g_SymbolValidator.TickValue();
     double tickSize = g_SymbolValidator.TickSize();
-    double pipValue = tickValue * (pointValue / tickSize);
+    
+    if(accountBalance <= 0.0 || pointValue <= 0.0)
+        return false;
+    
+    double pipValue = tickValue;
+    if(tickSize > 0.0)
+        pipValue = tickValue * (pointValue / tickSize);
+    if(pipValue == 0.0)
+        pipValue = tickValue;
+    if(pipValue == 0.0)
+        pipValue = 1.0;
     
     // Calculate profit in account currency
     double priceDiff = (orderType == "BUY" ? currentPrice - entryPrice : entryPrice - currentPrice);
@@ -198,16 +261,32 @@ bool ShouldActivateTrailing(double entryPrice, double currentPrice, string order
     // Calculate profit as percentage of account balance
     double profitPercent = (profitCurrency / accountBalance) * 100.0;
     
-    // Print debug information
-    if(profitPercent > 0)
+    double threshold = TrailingActivationPercent - 0.0000001;
+    bool reached = (profitPercent >= threshold);
+    
+    if(MathAbs(entryPrice - lastTrackedEntryPrice) > pointValue * 0.5)
     {
-        Print("Profit metrics - Price Diff: ", priceDiff, ", Points: ", profitPoints,
-              ", Currency: ", profitCurrency, ", Percent: ", profitPercent, "%");
+        activationLogged = false;
+        lastTrackedEntryPrice = entryPrice;
+    }
+    
+    if(!reached && activationLogged && profitPercent < threshold * 0.5)
+        activationLogged = false;
+    
+    if(reached && !activationLogged)
+    {
+        PrintFormat("ATR trailing activation triggered at %.2f%% profit (%.1f pts, %.2f %s) ≥ %.2f%% threshold",
+                    profitPercent,
+                    profitPoints,
+                    profitCurrency,
+                    AccountInfoString(ACCOUNT_CURRENCY),
+                    TrailingActivationPercent);
+        activationLogged = true;
     }
     
     // Check if profit percentage exceeds activation threshold
     // Add a small epsilon (0.0000001) to handle floating-point precision issues
-    return (profitPercent >= (TrailingActivationPercent - 0.0000001));
+    return reached;
 }
 
 //+------------------------------------------------------------------+
@@ -318,19 +397,16 @@ double CalculateTrailingStop(string orderType, double currentPrice, double origi
 //+------------------------------------------------------------------+
 bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
 {
-    // CRITICAL FIX: Force trailing to be active without checking settings
-    bool forceTrailing = ManualTrailingActivated;
-    if(!UseATRTrailing && !forceTrailing) 
-    {
-        return false;
-    }
-    
     // Get position information - try select by ticket first
     if(!PositionSelectByTicket(ticket))
     {
         Print("ERROR: Cannot select position ticket ", ticket, " - ", GetLastError());
         return false;
     }
+    
+    string positionComment = PositionGetString(POSITION_COMMENT);
+    if(!TrailingAllowedForPosition(positionComment))
+        return false;
     
     // Get current position data
     double currentSL = PositionGetDouble(POSITION_SL);

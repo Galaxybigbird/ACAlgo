@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                              MainACAlgorithm.mq5 |
+//|                              MainACAlgorithm_CustomCriterion.mq5 |
 //|                                                                  |
 //|                                                                  |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023"
 #property link      ""
-#property version   "1.44"
+#property version   "1.45"
 #property strict
 #property description "Main trading EA with Asymmetrical Compounding Risk Management"
 
@@ -23,8 +23,12 @@
 #include <FiboZigZag.mqh>             // Fibonacci ZigZag detection
 #include <IntrabarVolume.mqh>         // Intrabar volume filter
 #include <TotalPowerIndicator.mqh>    // Total power indicator filter
+#include <AC_OptCriterion.mqh>        // Custom optimization criterion
+#include <SymbolValidator.mqh>
+
 
 CSymbolValidator g_SymbolValidator;   // Shared symbol environment helper
+ACOptConfig g_ACOptCfg;               // Configuration for custom optimization criterion
 
 // Custom enum for VWAP timeframes with DISABLED option
 enum ENUM_VWAP_TIMEFRAMES
@@ -65,6 +69,23 @@ enum ENUM_TRADE_BIAS
 input group "==== Performance Settings ===="
 input bool     OptimizationMode = true;  // Enable optimization mode for faster backtesting
 input int      UpdateFrequency = 5;      // Update indicators every X ticks in backtest mode
+
+//--- Custom Optimization Criterion Settings
+input group "==== Optimization Criterion Settings ===="
+input bool     UseCustomMax          = true;   // Enable custom composite optimization criterion
+input int      Opt_MinTrades         = 50;     // Minimum trades required before scoring
+input double   Opt_MinOosPF          = 1.20;   // Minimum acceptable OOS profit factor
+input double   Opt_MaxOosDDPercent   = 30.0;   // Maximum allowed OOS drawdown percent
+input double   Opt_InSampleFraction  = 0.70;   // In-sample fraction for IS/OOS split
+input int      Opt_OosGapDays        = 1;      // Gap between IS and OOS periods (days)
+input int      Opt_McSimulations     = 500;    // Monte Carlo simulations
+input int      Opt_McBlockLen        = 5;      // Block length for bootstrap
+input int      Opt_McSeed            = 1337;   // Random seed for reproducibility
+input double   Opt_W_PF              = 1.0;    // Weight: OOS profit factor
+input double   Opt_W_DD              = 2.0;    // Weight: OOS drawdown penalty
+input double   Opt_W_Sharpe          = 1.0;    // Weight: OOS Sharpe bonus
+input double   Opt_W_McPF            = 1.0;    // Weight: MC PF robustness
+input double   Opt_W_McDD            = 2.0;    // Weight: MC drawdown penalty
 
 //--- Input Parameters for Trading
 input group "==== Trading Settings ===="
@@ -194,6 +215,10 @@ double g_MaxConsecWins = 0;      // Maximum consecutive winners
 double g_MaxConsecLoss = 0;      // Maximum consecutive losers
 double g_AvgWinAmount = 0;       // Average win amount
 double g_AvgLossAmount = 0;      // Average loss amount
+int      g_ACOptCsvHandle = INVALID_HANDLE;
+string   g_ACOptCsvFilename = "";
+string   g_ACOptCsvPath = "";
+datetime g_ACOptRunStart = 0;
 
 //--- Global Variables
 CTrade trade;                      // Trade object for executing trades
@@ -272,7 +297,7 @@ int tickCounter = 0;                // Counter for updating on specific ticks
 bool isInBacktest = false;          // Flag for backtest mode
 bool isForwardTest = false;         // Flag for forward test stage during optimization
 bool isFastModeContext = false;     // Indicates optimization/forward contexts where we throttle work
-bool allowVerboseLogs = true;       // Helper to disable noisy logging during tester runs
+bool processEveryTick = false;      // Controls whether we evaluate logic on every tick
 
 // Custom optimization reporting parameters
 double customWinRate = 0;            // Win rate for optimization results
@@ -298,7 +323,7 @@ int OnInit()
    // Treat both optimization and forward phases as "fast mode" to throttle heavy work
    isInBacktest = isOptimizationPass || isTesterPass;
    isFastModeContext = isInBacktest && (OptimizationMode || isForwardTest);
-   allowVerboseLogs = !isFastModeContext;
+   processEveryTick = !isFastModeContext;
    
    // Initialize the trade object
    trade.SetDeviationInPoints(Slippage);
@@ -307,14 +332,8 @@ int OnInit()
    // Initialize risk management system
    InitializeACRiskManagement();
    
-   if(allowVerboseLogs)
-      Print("Asymmetrical Compounding Risk Management initialized with base risk: ", AC_BaseRisk, "%");
-   
    // Initialize ATR trailing stop system
    InitDEMAATR();
-   
-   if(allowVerboseLogs)
-      Print("DEMA-ATR trailing system initialized without visual indicators");
    
    // Initialize T3 indicator
    if(UseT3Indicator)
@@ -329,9 +348,6 @@ int OnInit()
       // Allocate memory for T3 buffer
       ArraySetAsSeries(T3Buffer, true);
       ArrayResize(T3Buffer, isFastModeContext ? 10 : 100);
-      
-      if(allowVerboseLogs)
-         Print("T3 indicator initialized successfully");
    }
    
    // Initialize VWAP indicator
@@ -400,9 +416,6 @@ int OnInit()
       ArrayResize(VWAPTF6Buffer, bufferSize);
       ArrayResize(VWAPTF7Buffer, bufferSize);
       ArrayResize(VWAPTF8Buffer, bufferSize);
-   
-      if(allowVerboseLogs)
-         Print("VWAP indicator initialized successfully");
    }
 
    // Initialize additional signal modules
@@ -424,7 +437,7 @@ int OnInit()
                                                         EngulfingStoch_MAMethod,
                                                         EngulfingStoch_PriceField);
 
-      if(!g_EngulfingStochReady && allowVerboseLogs)
+      if(!g_EngulfingStochReady)
          Print("[Init] Engulfing stochastic module failed to initialise - signal disabled.");
    }
 
@@ -440,7 +453,7 @@ int OnInit()
                                    QQE_AlertLevel,
                                    QQE_RequireLevelFilter);
 
-      if(!g_QQEReady && allowVerboseLogs)
+      if(!g_QQEReady)
          Print("[Init] QQE module failed to initialise - signal disabled.");
    }
 
@@ -456,7 +469,7 @@ int OnInit()
                                                 SuperTrend_PriceSource,
                                                 SuperTrend_TakeWicks);
 
-      if(!g_SuperTrendReady && allowVerboseLogs)
+      if(!g_SuperTrendReady)
          Print("[Init] SuperTrend module failed to initialise - signal disabled.");
    }
 
@@ -471,8 +484,6 @@ int OnInit()
                             FiboUseHighLowPrice, FiboUseATRFilter,
                             FiboRequireConfirmation, FiboConfirmationBars);
       g_FiboZigZagReady = true;
-      if(allowVerboseLogs)
-         Print("[Init] Fibo ZigZag module initialised.");
    }
 
    IntrabarVolumeSignal.Init(IntrabarVolumePeriod, IntrabarVolumeLookback,
@@ -484,31 +495,8 @@ int OnInit()
                                                 TPILookbackPeriod, TPIPowerPeriod,
                                                 TPIUseHundredSignal, TPIUseCrossoverSignal,
                                                 TPITriggerCandle);
-      if(!g_TotalPowerReady && allowVerboseLogs)
+      if(!g_TotalPowerReady)
          Print("[Init] Total Power Indicator failed to initialise - signal disabled.");
-   }
-   
-   if(allowVerboseLogs)
-   {
-      Print("=================================");
-      Print("✓ MainACAlgorithm EA initialized successfully");
-      Print("✓ Current risk setting: ", currentRisk, "%");
-      Print("✓ Base risk: ", AC_BaseRisk, "%", " | Base reward: ", AC_BaseReward);
-      Print("✓ ATR Period: ", ATRPeriod, " | ATR Multiplier: ", ATRMultiplier);
-      Print("✓ Risk Management Mode: ", UseACRiskManagement ? "Dynamic (AC)" : "Fixed lot");
-      Print("✓ T3 indicator: ", UseT3Indicator ? "Enabled" : "Disabled");
-      Print("✓ VWAP indicator: ", UseVWAPIndicator ? "Enabled" : "Disabled");
-      Print("✓ T3/VWAP filter: ", (UseT3VWAPFilter && UseT3Indicator && UseVWAPIndicator) ? "Enabled" : "Disabled");
-      Print("✓ Engulfing pattern: ", UseEngulfingPattern ? "Enabled" : "Disabled");
-      Print("✓ Engulfing + Stochastic: ", (UseEngulfingStochastic && g_EngulfingStochReady) ? "Enabled" : "Disabled");
-      Print("✓ QQE filter: ", (UseQQEIndicator && g_QQEReady) ? "Enabled" : "Disabled");
-      Print("✓ SuperTrend filter: ", (UseSuperTrendIndicator && g_SuperTrendReady) ? "Enabled" : "Disabled");
-      Print("✓ Fibo ZigZag filter: ", (UseFiboZigZagFilter && g_FiboZigZagReady) ? "Enabled" : "Disabled");
-      Print("✓ Intrabar volume filter: ", UseIntrabarVolumeFilter ? "Enabled" : "Disabled");
-      Print("✓ Total Power filter: ", (UseTotalPowerFilter && g_TotalPowerReady) ? "Enabled" : "Disabled");
-      Print("✓ MaxHoldBars clamp: ", MaxHoldBars > 0 ? StringFormat("%d bars", MaxHoldBars) : "Disabled");
-      Print("✓ Optimization Mode: ", OptimizationMode ? "Enabled" : "Disabled");
-      Print("=================================");
    }
    
    return(INIT_SUCCEEDED);
@@ -520,25 +508,6 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    // Set the optimization inputs to display our custom metrics in optimization results
-   if(MQLInfoInteger(MQL_OPTIMIZATION))
-   {
-      // Note: Unfortunately direct parameter setting is not supported during runtime in MQL5
-      // So we'll just ensure the values are available for the OnTester function
-      if(allowVerboseLogs)
-      {
-         Print("Final optimization metrics:");
-         Print("Win Rate: ", customWinRate, "%");
-         Print("Winning Trades: ", customWinningTrades);
-         Print("Losing Trades: ", customLosingTrades);
-         Print("Final Balance: ", customFinalBalance);
-         Print("Avg Trades Per Day: ", customAvgTradesDaily);
-         Print("Max Consecutive Winners: ", customMaxConsecWinners);
-         Print("Max Consecutive Losers: ", customMaxConsecLosers);
-         Print("Avg Win Amount: ", customAvgWinAmount);
-         Print("Avg Loss Amount: ", customAvgLossAmount);
-      }
-   }
-
    // Release ATR trailing resources
    CleanupATRTrailing();
 
@@ -552,9 +521,6 @@ void OnDeinit(const int reason)
    TotalPowerSignal.Shutdown();
    g_TotalPowerReady = false;
    g_TotalPowerSignal = 0;
-   
-   if(allowVerboseLogs)
-      Print("MainACAlgorithm EA removed - resources released");
 }
 
 //+------------------------------------------------------------------+
@@ -583,7 +549,7 @@ void OnTick()
    UpdateAllTrailingStops(newBar);
    
    // Update indicators only on new bars or when not in optimization mode
-   if(newBar || allowVerboseLogs)
+   if(newBar || processEveryTick)
    {
       lastBarTime = currentBarTime;
       UpdateIndicators();
@@ -610,8 +576,7 @@ void UpdateIndicators()
    
    if(CopyRates(_Symbol, PERIOD_CURRENT, 0, barsToRequest, priceRates) <= 0)
    {
-      if(allowVerboseLogs)
-         Print("Error copying rates data: ", GetLastError());
+      Print("Error copying rates data: ", GetLastError());
       return;
    }
    ArraySetAsSeries(priceRates, true);
@@ -920,12 +885,6 @@ int CombineSignalVotes(const int &signals[], const bool &enabled[], const int mo
          resolvedSignal = -1;
    }
 
-   if(resolvedSignal != 0 && allowVerboseLogs)
-   {
-      PrintFormat("[Signals] Votes -> Buy: %d (threshold %d), Sell: %d (threshold %d), Bias: %d",
-                  buyVotes, longThreshold, sellVotes, shortThreshold, TradeDirectionBias);
-   }
-
    return(resolvedSignal);
 }
 
@@ -1025,14 +984,6 @@ int ComputeT3VWAPSignal(const MqlRates &signalRates[])
          signal = -1;
    }
 
-   if(signal != 0 && allowVerboseLogs)
-   {
-      if(signal > 0)
-         Print("[Signals] T3/VWAP bullish crossover detected");
-      else
-         Print("[Signals] T3/VWAP bearish crossover detected");
-   }
-
    return(signal);
 }
 
@@ -1110,14 +1061,10 @@ void CheckForTradingSignals()
 
    if(combinedSignal > 0)
    {
-      if(allowVerboseLogs)
-         Print("Executing BUY trade based on combined signals");
       ExecuteTrade(ORDER_TYPE_BUY);
    }
    else if(combinedSignal < 0)
    {
-      if(allowVerboseLogs)
-         Print("Executing SELL trade based on combined signals");
       ExecuteTrade(ORDER_TYPE_SELL);
    }
 }
@@ -1127,30 +1074,19 @@ void CheckForTradingSignals()
 //+------------------------------------------------------------------+
 void ExecuteTrade(ENUM_ORDER_TYPE orderType)
 {
-   if(allowVerboseLogs)
-      Print("Starting trade execution for ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL", " order...");
-   
    // Calculate stop loss distance based on ATR
    double stopLossDistance = GetStopLossDistance();
    if(stopLossDistance <= 0)
    {
-      if(allowVerboseLogs)
-         Print("ERROR: Could not calculate stop loss distance. Trade aborted.");
+      Print("ERROR: Could not calculate stop loss distance. Trade aborted.");
       return;
    }
    
    double symbolPoint = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    double stopLossPoints = (symbolPoint > 0.0) ? stopLossDistance / symbolPoint : 0.0;
-   
-   if(allowVerboseLogs)
-      Print("Stop loss distance calculated: ", stopLossDistance, " (", stopLossPoints, " points)");
-   
    // Get account equity and risk amount in account currency
    double equity = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskAmount = equity * (currentRisk / 100.0);
-   
-   if(allowVerboseLogs)
-      Print("Account equity: $", equity, ", Risk amount ($): ", riskAmount);
    
    // Get current price for order
    double price = SymbolInfoDouble(_Symbol, orderType == ORDER_TYPE_BUY ? SYMBOL_ASK : SYMBOL_BID);
@@ -1174,8 +1110,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       else
          stopLossLevel = price + stopLossDistance;
 
-      if(allowVerboseLogs)
-         Print("WARNING: Stop distance adjusted to broker minimum: ", stopLossPoints, " points");
+      Print("WARNING: Stop distance adjusted to broker minimum: ", stopLossPoints, " points");
    }
 
    // Apply MaxHoldBars/MaxStopLossDistance clamp before sizing the trade
@@ -1217,10 +1152,7 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
                          price - stopLossDistance :
                          price + stopLossDistance;
 
-         if(allowVerboseLogs)
-         {
-            PrintFormat("Stop distance clamped to %.2f points using MaxHoldBars/MaxStopLossDistance", stopLossPoints);
-         }
+         PrintFormat("Stop distance clamped to %.2f points using MaxHoldBars/MaxStopLossDistance", stopLossPoints);
       }
    }
 
@@ -1243,10 +1175,6 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
                          : price + stopLossDistance;
       }
    }
-   
-   if(allowVerboseLogs)
-      Print("Entry price: ", price, ", Stop loss level: ", stopLossLevel, " (", stopLossPoints, " points)");
-   
    // DETERMINE ACCURATE POINT VALUE AND LOT SIZE
    // ---------------------------------------------
    double lotSize = DefaultLot; // Start with default
@@ -1255,51 +1183,33 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
    {
       // DETERMINE TRUE FINANCIAL VALUE OF POINTS FOR THIS SYMBOL
       // We use a practical approach: calculate the exact money value of a 1-lot position with 1-point stop
-      double testLot = 1.0; // Use 1.0 lot for calculation
-      double testPointDistance = 1.0; // 1 point distance
-      double testPriceMovement = testPointDistance * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      
       // Get contract specifications
       double contractSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_CONTRACT_SIZE);
       double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double tickSizeVal = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
       double pointSize = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       
-      // Calculate how many ticks are in one point
-      double ticksPerPoint = pointSize / tickSize;
-      
+      // Calculate how many ticks are in one point (guard against zero tick size)
+      double ticksPerPoint = (tickSizeVal > 0.0 ? pointSize / tickSizeVal : 1.0);
+      if(ticksPerPoint <= 0.0)
+         ticksPerPoint = 1.0;
+
       // Calculate money value of one point for 1.0 lot
       double onePointValue = tickValue * ticksPerPoint;
+      if(onePointValue <= 0.0)
+         onePointValue = pointSize * contractSize; // conservative fallback
       
       // Calculate money value of one point for our desired lot size
       double onePointPerLotValue = onePointValue; // Value of one point for 1.0 lot
-      
-      if(allowVerboseLogs)
-      {
-         Print("SYMBOL SPECIFICATIONS:");
-         Print("- Contract Size: ", contractSize);
-         Print("- Tick Value: ", tickValue);
-         Print("- Tick Size: ", tickSize);
-         Print("- Point Size: ", pointSize);
-         Print("- Ticks per Point: ", ticksPerPoint);
-         Print("- Value of ONE POINT for 1.0 lot: $", onePointPerLotValue);
-      }
       
       // Calculate lot size to achieve desired risk
       // Formula: lotSize = riskAmount / (stopLossPoints * onePointPerLotValue)
       lotSize = riskAmount / (stopLossPoints * onePointPerLotValue);
       
-      if(allowVerboseLogs)
-         Print("LOT SIZE CALCULATION: Risk $ ", riskAmount, 
-              " / (", stopLossPoints, " points * $", onePointPerLotValue, " per point per 1.0 lot) = ", lotSize, " lots");
-      
       // Get symbol volume constraints for validation
       double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
       double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
       double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-      
-      if(allowVerboseLogs)
-         Print("Symbol volume constraints - Min: ", minLot, ", Max: ", maxLot, ", Step: ", lotStep);
       
       // Round to the nearest lot step and apply constraints
       lotSize = MathFloor(lotSize / lotStep) * lotStep;
@@ -1309,18 +1219,10 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       // Re-verify risk with the adjusted lot size
       double actualRiskAmount = lotSize * stopLossPoints * onePointPerLotValue;
       double actualRiskPercent = (actualRiskAmount / equity) * 100.0;
-      
-      if(allowVerboseLogs)
-      {
-         Print("Final lot size after adjustments: ", lotSize);
-         Print("Actual risk with this lot size: $", actualRiskAmount, " (", actualRiskPercent, "% of account)");
-      }
+      if(MathAbs(actualRiskPercent - currentRisk) > 0.5)
+         PrintFormat("Risk adjusted to %.2f%% because of broker constraints.", actualRiskPercent);
    }
-   else
-   {
-      if(allowVerboseLogs)
-         Print("Using fixed lot size: ", lotSize, " (AC Risk Management disabled)");
-   }
+   // Fixed-lot mode intentionally suppresses additional messaging.
    
    // Calculate take profit based on reward target
    double takeProfitDistance = 0.0;
@@ -1338,15 +1240,6 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       // Calculate take profit points based on the R:R ratio
       double takeProfitPoints = stopLossPoints * riskToRewardRatio;
       takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-      
-      if(allowVerboseLogs)
-      {
-         Print("TAKE PROFIT CALCULATION:");
-         Print("  Stop loss distance: ", stopLossPoints, " points");
-         Print("  Risk: ", currentRisk, "%, Reward: ", currentReward, "%");
-         Print("  Risk:Reward ratio: 1:", riskToRewardRatio);
-         Print("  Take profit distance: ", takeProfitPoints, " points");
-      }
    }
    else
    {
@@ -1354,69 +1247,35 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType)
       double takeProfitPoints = stopLossPoints * AC_BaseReward;
       takeProfitDistance = takeProfitPoints * SymbolInfoDouble(_Symbol, SYMBOL_POINT);
       riskToRewardRatio = AC_BaseReward;
-      if(allowVerboseLogs)
-         Print("Using fixed R:R ratio of 1:", AC_BaseReward);
    }
    
    if(orderType == ORDER_TYPE_BUY)
       takeProfitLevel = price + takeProfitDistance;
    else
       takeProfitLevel = price - takeProfitDistance;
-   
-   if(allowVerboseLogs)
-      Print("Take profit level: ", takeProfitLevel);
-   
    // Set takeProfitLevel to 0 to disable automatic take profit if not using take profit
    if(!UseTakeProfit)
    {
       takeProfitLevel = 0;
-      if(allowVerboseLogs)
-         Print("Take profit disabled - manual close required");
-   }
-   else
-   {
-      if(allowVerboseLogs)
-         Print("Automatic take profit enabled at level: ", takeProfitLevel);
+      Print("Take profit disabled - manual close required");
    }
    
-   // Execute the trade
-   if(allowVerboseLogs)
-      Print("Executing trade: ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL", " ", lotSize, " lots @ ", price);
-      
    string tradeComment = BuildTradeComment(riskToRewardRatio);
    trade.PositionOpen(_Symbol, orderType, lotSize, price, stopLossLevel, takeProfitLevel, tradeComment);
    
    if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
    {
       ulong ticket = trade.ResultOrder();
-      if(allowVerboseLogs)
-      {
-         Print("==== TRADE EXECUTED SUCCESSFULLY ====");
-         Print("Order Type: ", orderType == ORDER_TYPE_BUY ? "BUY" : "SELL");
-         Print("Lot Size: ", lotSize);
-         Print("Entry Price: ", price);
-         Print("Stop Loss: ", stopLossLevel, " (", stopLossPoints, " points)");
-         
-         if(UseTakeProfit)
-            Print("Take Profit: ", takeProfitLevel, " (", takeProfitDistance / SymbolInfoDouble(_Symbol, SYMBOL_POINT), " points)");
-         else
-            Print("Take Profit: DISABLED - close manually when desired");
-            
-         if(UseACRiskManagement)
-            Print("Risk: ", currentRisk, "%, Target Reward: ", currentReward, "%");
-         Print("Ticket #: ", ticket);
-         Print("====================================");
-      }
-      
-      // DO NOT force enable trailing as requested by user
-      if(allowVerboseLogs)
-         Print("NOTE: Trailing stops respect the UseATRTrailing setting; enable it to activate trailing management.");
+      PrintFormat("Trade executed (%s) %.2f lots @ %.5f, ticket %I64u",
+                  orderType == ORDER_TYPE_BUY ? "BUY" : "SELL",
+                  lotSize,
+                  price,
+                  ticket);
    }
    else
    {
-      if(allowVerboseLogs)
-         Print("ERROR: Trade execution failed. Error code: ", trade.ResultRetcode(),
-               ", Description: ", trade.ResultComment());
+      Print("ERROR: Trade execution failed. Error code: ", trade.ResultRetcode(),
+            ", Description: ", trade.ResultComment());
    }
 }
 
@@ -1450,13 +1309,14 @@ void UpdateAllTrailingStops(bool newBar = false)
 
             if(!trailingAllowed)
                continue;
-
+            
+            // Respect trailing activation threshold unless manual override is active
             if(!ManualTrailingActivated)
             {
                if(!ShouldActivateTrailing(entryPrice, currentPrice, orderType, volume, compoundedOverrideActive))
                   continue;
             }
-
+            
             // Update trailing stop for this position
             UpdateTrailingStop(ticket, entryPrice, orderType);
          }
@@ -1465,45 +1325,127 @@ void UpdateAllTrailingStops(bool newBar = false)
 }
 
 //+------------------------------------------------------------------+
+//| Helper: Calculate average trades per day from deal history       |
+//+------------------------------------------------------------------+
+double CalcTradesPerDayFromHistory()
+{
+   if(!HistorySelect(0, TimeCurrent()))
+      return 0.0;
+
+   int totalDeals = (int)HistoryDealsTotal();
+   if(totalDeals <= 0)
+      return 0.0;
+
+   datetime firstTime = 0;
+   datetime lastTime = 0;
+   int tradeCount = 0;
+
+   for(int i = 0; i < totalDeals; ++i)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0)
+         continue;
+
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+         continue;
+
+      long dealType = HistoryDealGetInteger(ticket, DEAL_TYPE);
+      if(dealType != DEAL_TYPE_BUY && dealType != DEAL_TYPE_SELL)
+         continue;
+
+      datetime dealTime = (datetime)HistoryDealGetInteger(ticket, DEAL_TIME);
+      if(tradeCount == 0)
+         firstTime = dealTime;
+      lastTime = dealTime;
+      ++tradeCount;
+   }
+
+   if(tradeCount <= 1)
+      return (double)tradeCount;
+
+   double days = MathMax(1.0, (double)(lastTime - firstTime) / 86400.0);
+   return (double)tradeCount / days;
+}
+
+//+------------------------------------------------------------------+
 //| OnTester function - required for strategy tester optimization     |
 //+------------------------------------------------------------------+
 double OnTester()
 {
    // Get account statistics
-   double profit = TesterStatistics(STAT_PROFIT);
-   double drawdown = TesterStatistics(STAT_EQUITYDD_PERCENT);
-   double trades = TesterStatistics(STAT_TRADES);
-   double profitFactor = TesterStatistics(STAT_PROFIT_FACTOR);
-   double sharpeRatio = TesterStatistics(STAT_SHARPE_RATIO);
-   double recoveryFactor = TesterStatistics(STAT_RECOVERY_FACTOR);
+   double profit        = TesterStatistics((ENUM_STATISTICS)STAT_PROFIT);
+   double trades        = TesterStatistics((ENUM_STATISTICS)STAT_TRADES);
+   double profitFactor  = TesterStatistics((ENUM_STATISTICS)STAT_PROFIT_FACTOR);
+   double sharpeRatio   = TesterStatistics((ENUM_STATISTICS)STAT_SHARPE_RATIO);
+   double recoveryFactor= TesterStatistics((ENUM_STATISTICS)STAT_RECOVERY_FACTOR);
+   double drawdown_rel = TesterStatistics((ENUM_STATISTICS)STAT_EQUITY_DDREL_PERCENT);
+   double finalBalance  = AccountInfoDouble(ACCOUNT_BALANCE);
    
    // Skip if no trades were made
    if(trades < 1)
-      return 0;
+      return UseCustomMax ? -DBL_MAX : 0.0;
       
    // Get additional statistics
-   double winningTrades = TesterStatistics(STAT_PROFIT_TRADES);
-   double losingTrades = TesterStatistics(STAT_LOSS_TRADES);
+   double winningTrades = TesterStatistics((ENUM_STATISTICS)STAT_PROFIT_TRADES);
+   double losingTrades = TesterStatistics((ENUM_STATISTICS)STAT_LOSS_TRADES);
    double winRate = (trades > 0) ? (winningTrades / trades) * 100.0 : 0;
-   double finalBalance = AccountInfoDouble(ACCOUNT_BALANCE); // Use current balance instead of STAT_BALANCE
-   
-   // Calculate average trades per day - use a simpler approach based on total bars tested
-   int totalBars = Bars(_Symbol, PERIOD_CURRENT); // Total bars in the test
-   double barPeriodInMinutes = PeriodSeconds(PERIOD_CURRENT) / 60.0;
-   double totalMinutes = totalBars * barPeriodInMinutes;
-   double tradingDays = MathMax(1.0, totalMinutes / (60 * 24)); // Convert minutes to days (min 1 day)
-   double avgTradesDaily = trades / tradingDays;
+   double avgTradesDaily = CalcTradesPerDayFromHistory();
    
    // Get consecutive winners and losers - use estimates based on total trades
    double maxConsecWinners = MathSqrt(winningTrades); // Estimate based on square root of winning trades
    double maxConsecLosers = MathSqrt(losingTrades);   // Estimate based on square root of losing trades
    
    // Get average win and loss amounts
-   double grossProfit = TesterStatistics(STAT_GROSS_PROFIT);
-   double grossLoss = TesterStatistics(STAT_GROSS_LOSS);
+   double grossProfit = TesterStatistics((ENUM_STATISTICS)STAT_GROSS_PROFIT);
+   double grossLoss = TesterStatistics((ENUM_STATISTICS)STAT_GROSS_LOSS);
    double avgWinAmount = (winningTrades > 0) ? grossProfit / winningTrades : 0;
    double avgLossAmount = (losingTrades > 0) ? grossLoss / losingTrades : 0;
    
+   double metric = profitFactor;
+
+   // Apply penalties for high drawdowns
+   if(drawdown_rel > 20)
+      metric *= 0.8;
+   if(drawdown_rel > 30)
+      metric *= 0.5;
+
+   // Bonus for good recovery factor
+   if(recoveryFactor > 2)
+      metric *= 1.2;
+
+   double resultScore = metric;
+
+   if(UseCustomMax)
+   {
+      g_ACOptCfg.MinTrades          = Opt_MinTrades;
+      g_ACOptCfg.MinOosPF           = Opt_MinOosPF;
+      g_ACOptCfg.MaxOosDDPercent    = Opt_MaxOosDDPercent;
+      g_ACOptCfg.InSampleFrac       = Opt_InSampleFraction;
+      g_ACOptCfg.OosGapDays         = Opt_OosGapDays;
+      g_ACOptCfg.McSimulations      = Opt_McSimulations;
+      g_ACOptCfg.McBlockLenTrades   = Opt_McBlockLen;
+      g_ACOptCfg.McSeed             = Opt_McSeed;
+      g_ACOptCfg.w_pf               = Opt_W_PF;
+      g_ACOptCfg.w_dd               = Opt_W_DD;
+      g_ACOptCfg.w_sharpe           = Opt_W_Sharpe;
+      g_ACOptCfg.w_mc_pf            = Opt_W_McPF;
+      g_ACOptCfg.w_mc_dd            = Opt_W_McDD;
+      g_ACOptCfg.MagicFilter        = MagicNumber;
+
+      AC_Opt_Init(g_ACOptCfg);
+      const double compositeScore = AC_CalcCustomCriterion();
+      AC_PublishFrames();
+      resultScore = compositeScore;
+
+      double tradesPerDayOpt = AC_GetTradesPerDay();
+      if(tradesPerDayOpt > 0.0)
+         avgTradesDaily = tradesPerDayOpt;
+
+      double ddFromCriterion = AC_GetOosDrawdownPercent();
+      if(drawdown_rel <= 0.0 && ddFromCriterion > 0.0)
+         drawdown_rel = ddFromCriterion;
+   }
+
    // Store values in global variables for optimization results display
    customWinRate = NormalizeDouble(winRate, 2);
    customWinningTrades = winningTrades;
@@ -1514,30 +1456,24 @@ double OnTester()
    customMaxConsecLosers = maxConsecLosers;
    customAvgWinAmount = NormalizeDouble(avgWinAmount, 2);
    customAvgLossAmount = NormalizeDouble(avgLossAmount, 2);
-   
-   // Display all statistics in the optimization chart
-   // Add custom comment that will be visible in optimization results
+
    string customStats = StringFormat(
       "WR=%.1f%% WT=%d LT=%d Bal=%.2f TpD=%.1f CW=%d CL=%d AW=%.2f AL=%.2f",
       customWinRate, (int)customWinningTrades, (int)customLosingTrades,
-      customFinalBalance, customAvgTradesDaily, 
+      customFinalBalance, customAvgTradesDaily,
       (int)customMaxConsecWinners, (int)customMaxConsecLosers,
       customAvgWinAmount, customAvgLossAmount
    );
-   
-   // Make the custom statistics visible in tester results
+
    if(MQLInfoInteger(MQL_TESTER) && !MQLInfoInteger(MQL_OPTIMIZATION))
    {
-      // When in visual backtest, show detailed stats
       Print("=== STRATEGY PERFORMANCE METRICS ===");
       Print("Profit: ", profit);
-      Print("Drawdown %: ", drawdown);
+      Print("Drawdown %: ", drawdown_rel);
       Print("Total Trades: ", trades);
       Print("Profit Factor: ", profitFactor);
       Print("Sharpe Ratio: ", sharpeRatio);
       Print("Recovery Factor: ", recoveryFactor);
-      
-      // Additional metrics
       Print("Win Rate: ", customWinRate, "%");
       Print("Winning Trades: ", (int)customWinningTrades);
       Print("Losing Trades: ", (int)customLosingTrades);
@@ -1548,12 +1484,9 @@ double OnTester()
       Print("Avg Win Amount: ", customAvgWinAmount);
       Print("Avg Loss Amount: ", customAvgLossAmount);
       Print("====================================");
-      
-      // Show stats in chart comment
       Comment(customStats);
    }
-   
-   // In optimization mode, update the global variables for display
+
    if(MQLInfoInteger(MQL_OPTIMIZATION))
    {
       g_WinRate = customWinRate;
@@ -1567,22 +1500,7 @@ double OnTester()
       g_AvgLossAmount = customAvgLossAmount;
    }
 
-   // Return a custom metric for optimization
-   // Using a combination of profit factor and recovery factor
-   // with penalties for high drawdown
-   double metric = profitFactor;
-   
-   // Apply penalties for high drawdowns
-   if(drawdown > 20)
-      metric *= 0.8;
-   if(drawdown > 30)
-      metric *= 0.5;
-   
-   // Bonus for good recovery factor
-   if(recoveryFactor > 2)
-      metric *= 1.2;
-   
-   return metric;
+   return resultScore;
 }
 
 //+------------------------------------------------------------------+
@@ -1623,4 +1541,140 @@ void PrintOptimizationMetrics(
    
    // Print to the log - this will appear in the Journal tab
    Print(stats);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: drain ACOPT frames into CSV                              |
+//+------------------------------------------------------------------+
+void AC_WriteFramesToCsv()
+{
+   if(!UseCustomMax || g_ACOptCsvHandle == INVALID_HANDLE)
+      return;
+
+   ulong frameId = 0;
+   string frameName;
+   long passId = 0;
+   double frameScore = 0.0;
+   double payload[];
+
+   while(FrameNext(frameId, frameName, passId, frameScore, payload))
+   {
+      if(frameName != "ACOPT")
+         continue;
+
+      int payloadSize = ArraySize(payload);
+      if(payloadSize < ACOPT__COUNT)
+      {
+         PrintFormat("ACOPT frame payload too small (%d).", payloadSize);
+         continue;
+      }
+
+      payload[ACOPT_SCORE] = frameScore;
+
+      FileWrite(g_ACOptCsvHandle,
+                (int)passId,
+                payload[ACOPT_SCORE],
+                payload[ACOPT_PF_IS],
+                payload[ACOPT_PF_OOS],
+                payload[ACOPT_DD_IS_PCT],
+                payload[ACOPT_DD_OOS_PCT],
+                payload[ACOPT_SHARPE_IS],
+                payload[ACOPT_SHARPE_OOS],
+                payload[ACOPT_SORTINO_IS],
+                payload[ACOPT_SORTINO_OOS],
+                payload[ACOPT_SERENITY_IS],
+                payload[ACOPT_SERENITY_OOS],
+                payload[ACOPT_MC_PF_P5],
+                payload[ACOPT_MC_DD_P95],
+                payload[ACOPT_MC_P_RUIN],
+                payload[ACOPT_KS_DIST],
+                payload[ACOPT_JB_P],
+                payload[ACOPT_TRADES_TOTAL],
+                payload[ACOPT_TRADES_PER_DAY],
+                payload[ACOPT_WINRATE_OOS_PCT],
+                payload[ACOPT_EXP_PAYOFF_OOS],
+                payload[ACOPT_AVG_WIN_OOS],
+                payload[ACOPT_AVG_LOSS_OOS],
+                payload[ACOPT_PAYOFF_RATIO_OOS]);
+   }
+
+   FileFlush(g_ACOptCsvHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Tester lifecycle: initialization                                 |
+//+------------------------------------------------------------------+
+void OnTesterInit()
+{
+   g_ACOptCsvHandle = INVALID_HANDLE;
+   g_ACOptCsvFilename = "";
+   g_ACOptCsvPath = "";
+   g_ACOptRunStart = 0;
+
+   if(!UseCustomMax)
+      return;
+
+   g_ACOptRunStart = TimeCurrent();
+   g_ACOptCsvFilename = StringFormat("ACOPT_%s_%I64d.csv", _Symbol, (long)g_ACOptRunStart);
+   g_ACOptCsvHandle = FileOpen(g_ACOptCsvFilename, FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_COMMON, ';');
+   if(g_ACOptCsvHandle == INVALID_HANDLE)
+   {
+      PrintFormat("Failed to create optimization CSV %s (%d).", g_ACOptCsvFilename, GetLastError());
+      g_ACOptCsvFilename = "";
+      return;
+   }
+
+   g_ACOptCsvPath = TerminalInfoString(TERMINAL_COMMONDATA_PATH) + "\\Files\\" + g_ACOptCsvFilename;
+
+   FileWrite(g_ACOptCsvHandle,
+             "pass_id",
+             "score",
+             "pf_is",
+             "pf_oos",
+             "dd_is_percent",
+             "dd_oos_percent",
+             "sharpe_is",
+             "sharpe_oos",
+             "sortino_is",
+             "sortino_oos",
+             "serenity_is",
+             "serenity_oos",
+             "mc_pf_p5",
+             "mc_dd_p95",
+             "mc_p_ruin",
+             "ks_dist",
+             "jb_p",
+             "trades_total",
+             "trades_per_day",
+             "winrate_oos_pct",
+             "expected_payoff_oos",
+             "avg_win_oos",
+             "avg_loss_oos",
+             "payoff_ratio_oos");
+   FileFlush(g_ACOptCsvHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Consume frames after each tester pass                            |
+//+------------------------------------------------------------------+
+void OnTesterPass()
+{
+   AC_WriteFramesToCsv();
+}
+
+//+------------------------------------------------------------------+
+//| Tester cleanup                                                   |
+//+------------------------------------------------------------------+
+void OnTesterDeinit()
+{
+   AC_WriteFramesToCsv();
+
+   if(g_ACOptCsvHandle != INVALID_HANDLE)
+   {
+      FileClose(g_ACOptCsvHandle);
+      g_ACOptCsvHandle = INVALID_HANDLE;
+   }
+
+   if(UseCustomMax && g_ACOptCsvFilename != "")
+      PrintFormat("AC optimization frames saved to %s.", g_ACOptCsvPath);
 }
