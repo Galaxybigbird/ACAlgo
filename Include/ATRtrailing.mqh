@@ -12,12 +12,12 @@
 
 // Input parameters for DEMA-ATR trailing stop
 input group    "==== DEMA-ATR Trailing ====";
-input int      DEMA_ATR_Period = 14;       // Period for DEMA-ATR calculation
-input double   DEMA_ATR_Multiplier = 1.5;  // ATR trailing distance multiplier
+input int      DEMA_ATR_Period = 14;       // DEMA ATR Period
+input double   DEMA_ATR_Multiplier = 1.5;  // DEMA ATR Multiplier
 input double   TrailingActivationPercent = 1.0; // Activate trailing at this profit %
-input bool     UseATRTrailing = true;      // Enable DEMA-ATR trailing stop
-input bool     UseTrailingOnCompoundedTrades = false; // Allow trailing on compounded trades when main toggle is off
-input double   MinimumStopDistance = 400.0; // Minimum stop distance in points
+input bool     UseATRTrailing = true;      // Enable DEMA-ATRTrailing
+input bool     UseTrailingOnCompoundedTrades = false; // UseTrailingOnCompoundedTrades when main toggle is off
+input double   MinimumStopDistance = 400.0; // MINIMUMStopDistance in points
 
 // Retained constant name for compatibility with legacy modules/tests
 string         ButtonName = "StartTrailing";
