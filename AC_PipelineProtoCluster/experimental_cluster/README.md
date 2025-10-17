@@ -10,10 +10,11 @@ This directory contains duplicate Expert Advisors that integrate the staging and
 | `AC_SBS_Base.mq5`              | `AC_PipelineProtoCluster/experimental_cluster/AC_SBS_Base_Cluster.mq5`              | Persists optimisation passes to SQLite.    |
 
 ## Stage‑2 portfolio EAs
-| Base EA                                | Cluster Variant Path                                                           | Notes                                                                 |
-|----------------------------------------|---------------------------------------------------------------------------------|-----------------------------------------------------------------------|
-| `ACMultiSymbolAlgorithm.mq5`           | `AC_PipelineProtoCluster/experimental_cluster/ACMultiSymbolAlgorithm_Cluster.mq5`           | Adds `useClusters_` filtering for selecting distinct passes per cluster. |
-| `DifferentEAs/ACMultiSACBreakRevertPro.mq5` | `AC_PipelineProtoCluster/experimental_cluster/ACMultiSACBreakRevertPro_Cluster.mq5` | Adds `useClusters_` filtering for multi-symbol BreakRevert portfolios.  |
+| Stage‑1 Source EA          | Stage‑2 Variant Path                                                                       | Notes                                                                                 |
+|---------------------------|---------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| `MainACAlgorithm.mq5`     | `AC_PipelineProtoCluster/experimental_cluster/MainACAlgorithm_Stage2_Cluster.mq5`          | Builds a portfolio score from logged passes; `useClusters_` enforces per-cluster picks. |
+| `ACBreakRevertPro.mq5`    | `AC_PipelineProtoCluster/experimental_cluster/ACBreakRevertPro_Stage2_Cluster.mq5`         | Same selector flow tailored to BreakRevertPro optimisation results.                    |
+| `AC_SBS_Base.mq5`         | `AC_PipelineProtoCluster/experimental_cluster/AC_SBS_Base_Stage2_Cluster.mq5`              | Stage‑2 selector for SBS passes with clustering-aware filtering.                       |
 
 All variants depend on the upstream `ClusteringLib` modules (see `AC_PipelineProtoCluster/ClusteringLib/`).
 
