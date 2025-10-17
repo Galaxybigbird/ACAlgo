@@ -4,11 +4,20 @@
 //|                                                                  |
 //|  This revision wraps pattern logic inside a class, exposes       |
 //|  granular validation toggles, adds structured logging, and       |
-//|  ensures CalculateLots() is consulted for every order so that    |
-//|  the external ACRM module can plug in cleanly.                   |
+//|  leverages AC risk management for dynamic position sizing.       |
 //+------------------------------------------------------------------+
+#property copyright   "AC Algo"
+#property link        ""
+#property version     "1.02"
+#property description "Swing Breakout Sequence base EA with AC risk integration"
 #property strict
 #include <Trade/Trade.mqh>
+#include <Trade/OrderInfo.mqh>
+#include <ACFunctions.mqh>
+
+CSymbolValidator g_SymbolValidator;
+double g_LastStopDistance   = 0.0;
+bool   g_SymbolReady        = false;
 
 enum ENTRY_PROFILE
   {
@@ -26,14 +35,15 @@ enum INVALIDATION_MODE
    INVALIDATE_CLOSE=1
   };
 
-//--- General SBS structure controls -------------------------------------------------------------
+//--- Input groups --------------------------------------------------------------------------------
+input group "==== SBS Structure Settings ===="
 input int      InpPivotLeft        = 2;       // pivot lookback left
 input int      InpPivotRight       = 2;       // pivot lookback right
 input double   InpMinHeightPct     = 0.10;    // minimum pattern height (% of price)
 input int      InpMaxWidthBars     = 50;      // maximum bars contained in pattern
 input double   InpMinQualityRatio  = 0.90;    // SBS ratio threshold (TP distance / SL distance)
 
-//--- Validation toggles -------------------------------------------------------------------------
+input group "==== Validation Toggles ===="
 input bool              InpUseStrictPattern   = true;   // enforce strict alternating structure
 input bool              InpRequireSweep       = true;   // require liquidity sweep (P4 vs P2)
 input bool              InpUseQualityGate     = true;   // enforce quality ratio at validation bar
@@ -41,25 +51,25 @@ input bool              InpUseInvalidation    = true;   // invalidate if price m
 input INVALIDATION_MODE InpInvalidationMode   = INVALIDATE_WICK; // wick or close invalidation
 input bool              InpLogEvents          = true;   // enable verbose logging for tracing
 
-//--- Market structure filters -------------------------------------------------------------------
+input group "==== Market Structure Filters ===="
 input bool     InpUseBOSFilter     = true;    // require Break of Structure in pattern direction
 input bool     InpUseMSSFilter     = false;   // require Market Structure Shift (ICT style)
 
-//--- Entry & execution --------------------------------------------------------------------------
+input group "==== Entry & Execution ===="
 input ENTRY_PROFILE InpEntryProfile = ENTRY_BREAKOUT;
 input int      InpBreakoutSwing     = 3;      // swing to break: 1..4
 input bool     InpUseGoldenFib      = true;   // enable fib/"gold" logic
 input double   InpFibLevel          = 0.618;  // fibonacci entry level (0..1)
 input bool     InpImmediateSwing4   = false;  // validate on fib tap without waiting for swing-5
 
-//--- Exits / risk placeholders ------------------------------------------------------------------
+input group "==== Exit & Risk Settings ===="
 input SL_MODE  InpSLMode            = SL_ATR;
 input int      InpATRPeriod         = 14;
 input double   InpATRMul            = 2.0;
 input TP_MODE  InpTPMode            = TP_RR;
 input double   InpRRTarget          = 2.0;
 
-//--- Runtime / misc -----------------------------------------------------------------------------
+input group "==== General Settings ===="
 input int      InpLookbackBars      = 1500;   // scan depth in bars
 input int      InpMagic             = 270915;
 input double   InpLots              = 0.10;   // fallback lot size (ACRM replaces via CalculateLots)
@@ -71,9 +81,16 @@ input int      InpPendingTTLMinutes      = 0;     // pending order time-to-live 
 
 //--- Global runtime objects ---------------------------------------------------------------------
 CTrade         Trade;
-int            atrHandle = INVALID_HANDLE;
+int            g_AtrHandle = INVALID_HANDLE;
 MqlTick        lastTick;
 datetime       lastBarTime = 0;
+
+double         g_HighSeries[];
+double         g_LowSeries[];
+double         g_CloseSeries[];
+int            g_SeriesCount = 0;
+double         g_LastATR = 0.0;
+bool           g_SeriesInitialized = false;
 
 //--- Lightweight swing descriptor ---------------------------------------------------------------
 struct SwingPoint
@@ -97,11 +114,13 @@ void Log(const string message)
 //+------------------------------------------------------------------+
 string BuildOrderComment(ENTRY_PROFILE profile,bool isBuy,double guard,INVALIDATION_MODE mode)
   {
-   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   long digits=0;
+   if(!SymbolInfoInteger(_Symbol,SYMBOL_DIGITS,digits))
+      digits=0;
    return StringFormat("SBS|p%d|d%d|g%s|m%d",
                        (int)profile,
                        (isBuy ? 1 : 0),
-                       DoubleToString(guard,digits),
+                       DoubleToString(guard,(int)digits),
                        (int)mode);
   }
 
@@ -116,7 +135,7 @@ bool ParseOrderComment(const string comment,ENTRY_PROFILE &profile,bool &isBuy,d
       return false;
 
    string parts[];
-   int count=StringSplit(comment,"|",parts);
+   int count=StringSplit(comment,'|',parts);
    if(count<5)
       return false;
 
@@ -177,7 +196,10 @@ bool HasActiveOrder(ENTRY_PROFILE profile,bool isBuy)
    int total=OrdersTotal();
    for(int i=0;i<total;i++)
      {
-      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))
+      ulong ticket=OrderGetTicket(i);
+      if(ticket==0)
+         continue;
+      if(!OrderSelect(ticket))
          continue;
       if(OrderGetInteger(ORDER_MAGIC)!=InpMagic)
          continue;
@@ -227,8 +249,10 @@ bool CancelOrder(ulong ticket,const string reason)
 //+------------------------------------------------------------------+
 double NormalizePrice(double value)
   {
-   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
-   return NormalizeDouble(value,digits);
+   long digits=0;
+   if(SymbolInfoInteger(_Symbol,SYMBOL_DIGITS,digits))
+      return NormalizeDouble(value,(int)digits);
+   return value;
   }
 
 double NormalizeVolume(double lots)
@@ -239,9 +263,15 @@ double NormalizeVolume(double lots)
    if(step>0.0)
       lots = MathRound(lots/step)*step;
    lots = MathMax(minLot, MathMin(maxLot, lots));
-   int volDigits=(int)SymbolInfoInteger(_Symbol,SYMBOL_VOLUME_DIGITS);
-   if(volDigits>0)
-      lots = NormalizeDouble(lots, volDigits);
+   int volumeDigits=0;
+   double tmpStep=step;
+   while(volumeDigits<8 && tmpStep>0.0 && MathAbs(tmpStep-MathRound(tmpStep))>1e-10)
+     {
+      tmpStep*=10.0;
+      volumeDigits++;
+     }
+   if(volumeDigits>0)
+      lots = NormalizeDouble(lots,volumeDigits);
    return lots;
   }
 
@@ -250,16 +280,37 @@ double NormalizeVolume(double lots)
 //+------------------------------------------------------------------+
 double GetATR(int shift)
   {
-   static double buffer[];
-   if(atrHandle==INVALID_HANDLE)
+   if(g_SeriesCount<=0)
+      return g_LastATR;
+
+   if(g_LastATR<=0.0 || g_SeriesCount<InpATRPeriod+1)
      {
-      atrHandle = iATR(_Symbol,_Period,InpATRPeriod);
-      if(atrHandle==INVALID_HANDLE)
-         return 0.0;
+      g_AtrHandle = iATR(_Symbol,_Period,InpATRPeriod);
+      if(g_AtrHandle==INVALID_HANDLE)
+         return g_LastATR;
+      double atrBuf[];
+      if(CopyBuffer(g_AtrHandle,0,0,InpATRPeriod+1,atrBuf)<=0)
+        {
+         IndicatorRelease(g_AtrHandle);
+         g_AtrHandle=INVALID_HANDLE;
+         return g_LastATR;
+        }
+      g_LastATR = atrBuf[0];
+      IndicatorRelease(g_AtrHandle);
+      g_AtrHandle=INVALID_HANDLE;
+      return g_LastATR;
      }
-   if(CopyBuffer(atrHandle,0,shift,1,buffer)!=1)
-      return 0.0;
-   return buffer[0];
+
+   double tr=0.0;
+   double currHigh=g_HighSeries[0];
+   double currLow =g_LowSeries[0];
+   double prevClose=(g_SeriesCount>1) ? g_CloseSeries[1] : g_CloseSeries[0];
+   double diff1=currHigh-currLow;
+   double diff2=MathAbs(currHigh-prevClose);
+   double diff3=MathAbs(currLow-prevClose);
+   tr = MathMax(diff1,MathMax(diff2,diff3));
+   g_LastATR = ((g_LastATR*(InpATRPeriod-1))+tr)/InpATRPeriod;
+   return g_LastATR;
   }
 
 //+------------------------------------------------------------------+
@@ -267,10 +318,99 @@ double GetATR(int shift)
 //+------------------------------------------------------------------+
 double PercentOfPrice(double points)
   {
-   double mid=(High[0]+Low[0])*0.5;
+   if(g_SeriesCount==0)
+      return 0.0;
+   double mid=(g_HighSeries[0]+g_LowSeries[0])*0.5;
    if(mid<=0.0)
       mid=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
    return(points/mid);
+  }
+
+void ShiftSeries(int requiredBars)
+  {
+   if(g_SeriesCount<=0)
+      return;
+
+   int keep=MathMin(g_SeriesCount-1,requiredBars-1);
+   if(keep<0)
+      keep=0;
+
+   if(keep>0)
+     {
+      ArrayResize(g_HighSeries,keep);
+      ArrayResize(g_LowSeries,keep);
+      ArrayResize(g_CloseSeries,keep);
+     }
+   else
+     {
+      ArrayResize(g_HighSeries,0);
+      ArrayResize(g_LowSeries,0);
+      ArrayResize(g_CloseSeries,0);
+     }
+   g_SeriesCount=keep;
+  }
+
+bool AppendLatestBar(int requiredBars)
+  {
+   MqlRates rates[];
+   int copyCount=CopyRates(_Symbol,_Period,0,2,rates);
+   if(copyCount<=0)
+      return false;
+
+   double high=rates[0].high;
+   double low =rates[0].low;
+   double close=rates[0].close;
+
+   ArraySetAsSeries(g_HighSeries,true);
+   ArraySetAsSeries(g_LowSeries,true);
+   ArraySetAsSeries(g_CloseSeries,true);
+
+   ArrayResize(g_HighSeries,g_SeriesCount+1);
+   ArrayResize(g_LowSeries,g_SeriesCount+1);
+   ArrayResize(g_CloseSeries,g_SeriesCount+1);
+
+   for(int i=g_SeriesCount;i>0;--i)
+     {
+      g_HighSeries[i]=g_HighSeries[i-1];
+      g_LowSeries[i]=g_LowSeries[i-1];
+      g_CloseSeries[i]=g_CloseSeries[i-1];
+     }
+
+   g_HighSeries[0]=high;
+   g_LowSeries[0]=low;
+   g_CloseSeries[0]=close;
+   g_SeriesCount=MathMin(g_SeriesCount+1,requiredBars);
+
+   if(g_SeriesCount<=InpPivotRight)
+      return false;
+
+   return true;
+  }
+
+bool LoadInitialSeries(int requiredBars)
+  {
+   int bars=MathMin(requiredBars,(int)Bars(_Symbol,_Period));
+   if(bars<=0)
+      return false;
+
+   ArraySetAsSeries(g_HighSeries,true);
+   ArraySetAsSeries(g_LowSeries,true);
+   ArraySetAsSeries(g_CloseSeries,true);
+
+  if(CopyHigh(_Symbol,_Period,0,bars,g_HighSeries)!=bars)
+     return false;
+  if(CopyLow(_Symbol,_Period,0,bars,g_LowSeries)!=bars)
+     return false;
+  if(CopyClose(_Symbol,_Period,0,bars,g_CloseSeries)!=bars)
+     return false;
+
+  g_SeriesCount=bars;
+  if(g_SeriesCount<=InpPivotRight)
+     return false;
+
+   g_LastATR=0.0;
+
+  return true;
   }
 
 //+------------------------------------------------------------------+
@@ -294,7 +434,7 @@ public:
                                        m_heightPct(0.0), m_widthBars(0),
                                        m_stopLevel(0.0) {}
 
-   bool              BuildFromSwings(const SwingPoint swings[],int count,bool enforceStrict,string &reason);
+   bool              BuildFromSwings(const SwingPoint &swings[],int count,bool enforceStrict,string &reason);
    bool              IsReady(void) const      { return m_ready; }
    bool              IsBullish(void) const    { return m_bullish; }
    double            HeightPct(void) const    { return m_heightPct; }
@@ -318,7 +458,7 @@ public:
 //+------------------------------------------------------------------+
 //| Build pattern from swings                                        |
 //+------------------------------------------------------------------+
-bool CSBSPattern::BuildFromSwings(const SwingPoint swings[],int count,bool enforceStrict,string &reason)
+bool CSBSPattern::BuildFromSwings(const SwingPoint &swings[],int count,bool enforceStrict,string &reason)
   {
    m_ready=false;
    if(count<5)
@@ -548,22 +688,22 @@ bool CSBSPattern::IsLiquidityReversalArmed(double closePrev,double closeCurr) co
 //+------------------------------------------------------------------+
 bool IsPivotHigh(int bar,int left,int right)
   {
-   if(bar-left<0 || bar+right>=Bars(_Symbol,_Period))
+   if(bar-left<0 || bar+right>=g_SeriesCount)
       return false;
-   double probe=High[bar];
+   double probe=g_HighSeries[bar];
    for(int k=bar-left;k<=bar+right;++k)
-      if(High[k]>probe)
+      if(g_HighSeries[k]>probe)
          return false;
    return true;
   }
 
 bool IsPivotLow(int bar,int left,int right)
   {
-   if(bar-left<0 || bar+right>=Bars(_Symbol,_Period))
+   if(bar-left<0 || bar+right>=g_SeriesCount)
       return false;
-   double probe=Low[bar];
+   double probe=g_LowSeries[bar];
    for(int k=bar-left;k<=bar+right;++k)
-      if(Low[k]<probe)
+      if(g_LowSeries[k]<probe)
          return false;
    return true;
   }
@@ -571,9 +711,14 @@ bool IsPivotLow(int bar,int left,int right)
 int CollectSwings(SwingPoint &buffer[],int maxOut,int lookbackBars)
   {
    int count=0;
-   int start=MathMax(0,Bars(_Symbol,_Period)-1 - lookbackBars);
-   int end  =Bars(_Symbol,_Period)-1 - InpPivotRight;
+   int start=MathMax(0,g_SeriesCount-1 - lookbackBars);
+   int end  =g_SeriesCount-1 - InpPivotRight;
    int lastType=0;
+
+   if(end<0)
+      return 0;
+   if(start>end)
+      start=end;
 
    for(int i=end;i>=start && count<maxOut;--i)
      {
@@ -582,7 +727,7 @@ int CollectSwings(SwingPoint &buffer[],int maxOut,int lookbackBars)
          if(lastType!=+1)
            {
             buffer[count].index=i;
-            buffer[count].price=High[i];
+            buffer[count].price=g_HighSeries[i];
             buffer[count].type=+1;
             lastType=+1;
             count++;
@@ -593,7 +738,7 @@ int CollectSwings(SwingPoint &buffer[],int maxOut,int lookbackBars)
          if(lastType!=-1)
            {
             buffer[count].index=i;
-            buffer[count].price=Low[i];
+            buffer[count].price=g_LowSeries[i];
             buffer[count].type=-1;
             lastType=-1;
             count++;
@@ -613,7 +758,7 @@ int CollectSwings(SwingPoint &buffer[],int maxOut,int lookbackBars)
 //+------------------------------------------------------------------+
 //| BOS/MSS utilities (unchanged from skeleton)                      |
 //+------------------------------------------------------------------+
-bool CheckBOS(const SwingPoint swings[],int n,bool bullish)
+bool CheckBOS(const SwingPoint &swings[],int n,bool bullish)
   {
    if(n<4)
       return false;
@@ -656,7 +801,7 @@ bool CheckBOS(const SwingPoint swings[],int n,bool bullish)
    return(lastL<prevL);
   }
 
-bool CheckMSS(const SwingPoint swings[],int n,bool bullish)
+bool CheckMSS(const SwingPoint &swings[],int n,bool bullish)
   {
    if(n<5)
       return false;
@@ -763,11 +908,20 @@ double DetermineTakeProfit(bool isBuy,double entryPrice,double stopPrice,const C
 //+------------------------------------------------------------------+
 //| Volume helper using CalculateLots hook                           |
 //+------------------------------------------------------------------+
-double PrepareLots(double stopPrice,bool isBuy)
+double PrepareLots(double stopPrice,bool isBuy,double entryPrice,ENUM_ORDER_TYPE orderType)
   {
+   g_LastStopDistance = MathAbs(entryPrice - stopPrice);
+
    double lots=CalculateLots(stopPrice,isBuy);
    if(lots<=0.0)
       lots=InpLots;
+
+   if(g_SymbolReady)
+      lots = g_SymbolValidator.ValidateVolume(orderType,lots);
+
+   if(lots<=0.0)
+      lots=InpLots;
+
    return NormalizeVolume(lots);
   }
 
@@ -796,7 +950,7 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                Log("Skipped breakout buy: pending order already active.");
             else
               {
-               double lots=PrepareLots(stop,true);
+               double lots=PrepareLots(stop,true,entry,ORDER_TYPE_BUY_STOP);
                if(lots>0.0)
                  {
                   string comment=BuildOrderComment(ENTRY_BREAKOUT,true,pattern.GuardLevel(),InpInvalidationMode);
@@ -821,7 +975,7 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                Log("Skipped breakout sell: pending order already active.");
             else
               {
-               double lots=PrepareLots(stop,false);
+               double lots=PrepareLots(stop,false,entry,ORDER_TYPE_SELL_STOP);
                if(lots>0.0)
                  {
                   string comment=BuildOrderComment(ENTRY_BREAKOUT,false,pattern.GuardLevel(),InpInvalidationMode);
@@ -848,11 +1002,11 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                Log("Skipped golden buy: pending order already active.");
             else
               {
-               double lots=PrepareLots(stop,true);
+               double lots=PrepareLots(stop,true,entry,ORDER_TYPE_BUY_LIMIT);
                if(lots>0.0)
                  {
                   string comment=BuildOrderComment(ENTRY_GOLDEN_FIB,true,pattern.GuardLevel(),InpInvalidationMode);
-                  if(!Trade.BuyLimit(lots,entry,_Symbol,stop,tp,0,comment))
+                  if(!Trade.BuyLimit(lots,entry,_Symbol,stop,tp,0,0,comment))
                      Log(StringFormat("Failed to place golden-entry buy limit: %s",Trade.ResultRetcodeDescription()));
                  }
               }
@@ -871,11 +1025,11 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                Log("Skipped golden sell: pending order already active.");
             else
               {
-               double lots=PrepareLots(stop,false);
+               double lots=PrepareLots(stop,false,entry,ORDER_TYPE_SELL_LIMIT);
                if(lots>0.0)
                  {
                   string comment=BuildOrderComment(ENTRY_GOLDEN_FIB,false,pattern.GuardLevel(),InpInvalidationMode);
-                  if(!Trade.SellLimit(lots,entry,_Symbol,stop,tp,0,comment))
+                  if(!Trade.SellLimit(lots,entry,_Symbol,stop,tp,0,0,comment))
                      Log(StringFormat("Failed to place golden-entry sell limit: %s",Trade.ResultRetcodeDescription()));
                  }
               }
@@ -886,30 +1040,34 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
      {
       if(pattern.IsBullish() && InpAllowLongs)
         {
-         double entryPrice=(lastTick.ask>0.0 ? lastTick.ask : Ask);
+         double entryPrice=lastTick.ask;
+         if(entryPrice<=0.0)
+            entryPrice=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
          double stop=DetermineStop(true,entryPrice,pattern,atrValue);
          if(stop<=0.0 || entryPrice-stop<=point)
             Log("Skipped liquidity-reversal buy: invalid stop configuration.");
          else
            {
             double tp=DetermineTakeProfit(true,entryPrice,stop,pattern);
-            double lots=PrepareLots(stop,true);
+            double lots=PrepareLots(stop,true,entryPrice,ORDER_TYPE_BUY);
             if(lots>0.0)
-               Trade.Buy(lots,_Symbol,0.0,stop,tp,0,"SBS_LIQREV_BUY");
+               Trade.Buy(lots,_Symbol,0.0,stop,tp,"SBS_LIQREV_BUY");
            }
         }
       else if(!pattern.IsBullish() && InpAllowShorts)
         {
-         double entryPrice=(lastTick.bid>0.0 ? lastTick.bid : Bid);
+         double entryPrice=lastTick.bid;
+         if(entryPrice<=0.0)
+            entryPrice=SymbolInfoDouble(_Symbol,SYMBOL_BID);
          double stop=DetermineStop(false,entryPrice,pattern,atrValue);
          if(stop<=0.0 || stop-entryPrice<=point)
             Log("Skipped liquidity-reversal sell: invalid stop configuration.");
          else
            {
             double tp=DetermineTakeProfit(false,entryPrice,stop,pattern);
-            double lots=PrepareLots(stop,false);
+            double lots=PrepareLots(stop,false,entryPrice,ORDER_TYPE_SELL);
             if(lots>0.0)
-               Trade.Sell(lots,_Symbol,0.0,stop,tp,0,"SBS_LIQREV_SELL");
+               Trade.Sell(lots,_Symbol,0.0,stop,tp,"SBS_LIQREV_SELL");
            }
         }
      }
@@ -924,14 +1082,34 @@ void ManagePendingOrders(void)
    if(total<=0)
       return;
 
-   double prevClose = (Bars(_Symbol,_Period)>1 ? Close[1] : Close[0]);
-   double currLow   = Low[0];
-   double currHigh  = High[0];
+   double closeBuf[];
+   ArraySetAsSeries(closeBuf,true);
+   int copiedClose=CopyClose(_Symbol,_Period,0,2,closeBuf);
+   if(copiedClose<=0)
+      return;
+   ArrayResize(closeBuf,copiedClose);
+   double prevClose = (copiedClose>1 ? closeBuf[1] : closeBuf[0]);
+
+   double lowBuf[];
+   double highBuf[];
+   ArraySetAsSeries(lowBuf,true);
+   ArraySetAsSeries(highBuf,true);
+   if(CopyLow(_Symbol,_Period,0,1,lowBuf)!=1)
+      return;
+   if(CopyHigh(_Symbol,_Period,0,1,highBuf)!=1)
+      return;
+   ArrayResize(lowBuf,1);
+   ArrayResize(highBuf,1);
+   double currLow   = lowBuf[0];
+   double currHigh  = highBuf[0];
    datetime now     = TimeCurrent();
 
    for(int i=total-1;i>=0;--i)
      {
-      if(!OrderSelect(i,SELECT_BY_POS,MODE_TRADES))
+      ulong ticket=OrderGetTicket(i);
+      if(ticket==0)
+         continue;
+      if(!OrderSelect(ticket))
          continue;
 
       if(OrderGetInteger(ORDER_MAGIC)!=InpMagic)
@@ -943,7 +1121,6 @@ void ManagePendingOrders(void)
       if(!IsPendingOrderType(type))
          continue;
 
-      ulong ticket=(ulong)OrderGetInteger(ORDER_TICKET);
       bool orderBuy=IsBuyOrderType(type);
       string comment=OrderGetString(ORDER_COMMENT);
       ENTRY_PROFILE profile;
@@ -1005,17 +1182,36 @@ void ManagePendingOrders(void)
 //+------------------------------------------------------------------+
 void EvaluateAndTrade(void)
   {
-   const int MAX_SW=200;
-   SwingPoint swings[MAX_SW];
-   int n=CollectSwings(swings,MAX_SW,InpLookbackBars);
+   int requiredBars = InpLookbackBars + InpPivotLeft + InpPivotRight + 10;
+   if(!g_SeriesInitialized)
+     {
+      if(!LoadInitialSeries(requiredBars))
+         return;
+      g_SeriesInitialized=true;
+     }
+   else
+     {
+      ShiftSeries(requiredBars);
+      if(!AppendLatestBar(requiredBars))
+        {
+         if(!LoadInitialSeries(requiredBars))
+            return;
+        }
+     }
+
+   SwingPoint swings[200];
+   if(g_SeriesCount<=0)
+      return;
+
+   int n=CollectSwings(swings,200,InpLookbackBars);
    if(n<5)
       return;
 
-   int barsAvailable=Bars(_Symbol,_Period);
-   double prevClose=(barsAvailable>1 ? Close[1] : Close[0]);
-   double currClose=Close[0];
-   double prevHigh =(barsAvailable>1 ? High[1]  : High[0]);
-   double prevLow  =(barsAvailable>1 ? Low[1]   : Low[0]);
+   double currClose = g_CloseSeries[0];
+   double prevClose = (g_SeriesCount>1 ? g_CloseSeries[1] : currClose);
+
+   double prevHigh = (g_SeriesCount>1 ? g_HighSeries[1] : g_HighSeries[0]);
+   double prevLow  = (g_SeriesCount>1 ? g_LowSeries[1] : g_LowSeries[0]);
 
    CSBSPattern pattern;
    string reason;
@@ -1029,8 +1225,8 @@ void EvaluateAndTrade(void)
    bool immediateTriggered=false;
    if(InpImmediateSwing4 && InpBreakoutSwing==4)
      {
-      double refHigh=MathMax(prevHigh,High[0]);
-      double refLow =MathMin(prevLow,Low[0]);
+      double refHigh=MathMax(prevHigh,g_HighSeries[0]);
+      double refLow =MathMin(prevLow,g_LowSeries[0]);
       if(pattern.FibTouched(InpFibLevel,refHigh,refLow))
         {
          immediateTriggered=true;
@@ -1066,8 +1262,8 @@ void EvaluateAndTrade(void)
    double valLow =prevLow;
    if(immediateTriggered)
      {
-      valHigh=MathMax(valHigh,High[0]);
-      valLow =MathMin(valLow,Low[0]);
+      valHigh=MathMax(valHigh,g_HighSeries[0]);
+      valLow =MathMin(valLow,g_LowSeries[0]);
      }
 
    bool usedValidated=false;
@@ -1121,17 +1317,30 @@ void EvaluateAndTrade(void)
 int OnInit(void)
   {
    Trade.SetExpertMagicNumber(InpMagic);
-   Log("AC_SBS_Base initialised.");
-   return(INIT_SUCCEEDED);
+   if(!g_SymbolValidator.Init(_Symbol))
+     {
+      Log(StringFormat("Failed to initialise AC symbol validator for %s",_Symbol));
+      return INIT_FAILED;
+     }
+   g_SymbolValidator.Refresh();
+   g_SymbolReady=true;
+
+   InitializeACRiskManagement();
+   Log("AC_SBS_Base initialised with AC risk management.");
+   return INIT_SUCCEEDED;
   }
 
 void OnDeinit(const int reason)
   {
-   if(atrHandle!=INVALID_HANDLE)
+   if(g_AtrHandle!=INVALID_HANDLE)
      {
-      IndicatorRelease(atrHandle);
-      atrHandle=INVALID_HANDLE;
+      IndicatorRelease(g_AtrHandle);
+      g_AtrHandle=INVALID_HANDLE;
      }
+   g_SymbolReady=false;
+   g_SeriesInitialized=false;
+   g_SeriesCount=0;
+   g_LastATR=0.0;
    Log("AC_SBS_Base deinitialised.");
   }
 
@@ -1139,6 +1348,11 @@ void OnTick(void)
   {
    if(!SymbolInfoTick(_Symbol,lastTick))
       return;
+
+   if(g_SymbolReady)
+      g_SymbolValidator.Refresh();
+
+   UpdateRiskManagement(InpMagic);
 
    ManagePendingOrders();
 
@@ -1151,10 +1365,29 @@ void OnTick(void)
   }
 
 //+------------------------------------------------------------------+
-//| Placeholder lot calculator hook (ACRM integrates here)           |
+//| Lot calculator leveraging AC risk management modules             |
 //+------------------------------------------------------------------+
 double CalculateLots(double stopPrice,bool isBuy)
   {
-   // TODO: replace with Asymmetrical Compound Risk sizing.
-   return InpLots;
+   if(!g_SymbolReady)
+      return InpLots;
+
+   double stopDistance = g_LastStopDistance;
+   if(stopDistance<=0.0)
+     {
+      double refPrice = isBuy ? lastTick.ask : lastTick.bid;
+      if(refPrice<=0.0)
+         refPrice = SymbolInfoDouble(_Symbol,isBuy ? SYMBOL_ASK : SYMBOL_BID);
+      stopDistance = MathAbs(refPrice - stopPrice);
+     }
+
+   if(stopDistance<=0.0)
+      return InpLots;
+
+   double volume = CalculateLotSize(stopDistance);
+   if(volume<=0.0)
+      volume = InpLots;
+
+   g_LastStopDistance = 0.0;
+   return volume;
   }
