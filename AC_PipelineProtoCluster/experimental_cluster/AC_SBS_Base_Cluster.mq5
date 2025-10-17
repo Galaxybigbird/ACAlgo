@@ -15,6 +15,8 @@
 #include <Trade/OrderInfo.mqh>
 #include <ACFunctions_SBS.mqh>
 #include <ATRtrailing.mqh>
+#include <ClusteringLib/Database.mqh>
+#include <ClusteringLib/TesterHandler.mqh>
 
 CSymbolValidator g_SymbolValidator;
 double g_LastStopDistance   = 0.0;
@@ -79,6 +81,10 @@ input bool     InpAllowLongs        = true;
 input bool     InpPreventDuplicateOrders = true;  // InpPreventDuplicateOrders (avoid stacking identical pending orders)
 input bool     InpCancelOnInvalidation   = true;  // InpCancelOnInvalidation (delete orders when guard breached)
 input int      InpPendingTTLMinutes      = 0;     // InpPendingTTLMinutes (pending order time-to-live (minutes, 0=disable))
+
+input group "==== Optimization Logging ===="
+sinput int     idTask_         = 0;        // - Optimization task ID for clustering DB
+sinput string  fileName_       = "database.sqlite"; // - SQLite database file (ClusteringLib schema)
 
 //--- Global runtime objects ---------------------------------------------------------------------
 CTrade         Trade;
@@ -1376,6 +1382,59 @@ void OnTick(void)
       lastBarTime=barTime;
       EvaluateAndTrade();
      }
+  }
+
+//+------------------------------------------------------------------+
+//| Optimization DB integration hooks                                |
+//+------------------------------------------------------------------+
+int OnTesterInit()
+  {
+   if(idTask_ <= 0 || fileName_ == "")
+      return INIT_SUCCEEDED;
+
+   return CTesterHandler::TesterInit((ulong)idTask_, fileName_);
+  }
+
+void OnTesterPass()
+  {
+   if(idTask_ > 0)
+      CTesterHandler::TesterPass();
+  }
+
+void OnTesterDeinit()
+  {
+   if(idTask_ > 0)
+      CTesterHandler::TesterDeinit();
+  }
+
+double OnTester()
+  {
+   double profit        = TesterStatistics(STAT_PROFIT);
+   double drawdownPct   = TesterStatistics(STAT_EQUITYDD_PERCENT);
+   double trades        = TesterStatistics(STAT_TRADES);
+   double profitFactor  = TesterStatistics(STAT_PROFIT_FACTOR);
+   double sharpe        = TesterStatistics(STAT_SHARPE_RATIO);
+   double recovery      = TesterStatistics(STAT_RECOVERY_FACTOR);
+
+   if(trades < 1)
+      return 0.0;
+
+   double metric = profitFactor;
+
+   if(drawdownPct > 20.0)
+      metric *= 0.85;
+   if(drawdownPct > 35.0)
+      metric *= 0.6;
+
+   if(recovery > 2.0)
+      metric *= 1.1;
+   if(sharpe > 1.0)
+      metric *= 1.05;
+
+   if(idTask_ > 0)
+      CTesterHandler::Tester(metric, "");
+
+   return metric;
   }
 
 //+------------------------------------------------------------------+
