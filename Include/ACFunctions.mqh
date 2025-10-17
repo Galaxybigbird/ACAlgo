@@ -7,14 +7,14 @@
 
 // Risk management input parameters
 input group "==== AC Risk Management Parameters ===="
-input double AC_BaseRisk_Input = 1.0;          // Base risk percentage per trade
-input double AC_BaseReward_Input = 3.0;        // Base reward multiplier for calculating target
-input int    AC_CompoundingWins_Input = 2;     // Maximum consecutive wins to compound risk
-input bool   AC_EnablePartialCompounding_Input = false; // Enable recycling only part of reward after wins
-input double AC_PartialCompoundPercent_Input = 25.0;    // Percentage of reward to recycle (0-100)
-input int    ATRPeriod_Input = 25;             // Period for ATR calculation
-input double ATRMultiplier_Input = 1.5;        // Multiplier for ATR to determine stop loss distance
-input double MaxStopLossDistance_Input = 3500.0;    // Maximum stop loss distance in points
+input double AC_BaseRisk_Input = 1.0;          // AC BaseRisk 
+input double AC_BaseReward_Input = 3.0;        // AC BaseReward & Multiplier 
+input int    AC_CompoundingWins_Input = 2;     // AC CompoundingWins
+input bool   AC_EnablePartialCompounding_Input = false; // AC EnablePartialCompounding
+input double AC_PartialCompoundPercent_Input = 25.0;    // AC PartialCompoundPercent (0-100)
+input int    ATRPeriod_Input = 25;             // ATRPeriod
+input double ATRMultiplier_Input = 1.5;        // ATRMultiplier Determines SL&TP
+input double MaxStopLossDistance_Input = 3500.0;    // MAXStopLossDistance in points
 
 // Mutable global versions of the risk parameters (can be modified by test scripts)
 double AC_BaseRisk;          // Base risk percentage per trade
