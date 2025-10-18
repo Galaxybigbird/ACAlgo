@@ -84,7 +84,7 @@ input int      InpPendingTTLMinutes      = 0;     // InpPendingTTLMinutes (pendi
 
 input group "==== Optimization Logging ===="
 sinput int     idTask_         = 0;        // - Optimization task ID for clustering DB
-sinput string  fileName_       = "database.sqlite"; // - SQLite database file (ClusteringLib schema)
+sinput string  fileName_       = "C:\\Users\\marth\\AppData\\Roaming\\MetaQuotes\\Terminal\\E62C655ED163FFC555DD40DBEA67E6BB\\MQL5\\Files\\database.sqlite"; // - SQLite database file (ClusteringLib schema)
 
 //--- Global runtime objects ---------------------------------------------------------------------
 CTrade         Trade;

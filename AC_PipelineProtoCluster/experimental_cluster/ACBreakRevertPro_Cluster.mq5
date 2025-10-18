@@ -41,7 +41,7 @@ input int             Magic_Number             = 123456; // Magic Number for EA
 
 input group "==== Optimization Logging ===="
 sinput int            idTask_                  = 0;      // - Optimization task ID for clustering DB
-sinput string         fileName_                = "database.sqlite"; // - SQLite DB file name
+sinput string         fileName_                = "C:\\Users\\marth\\AppData\\Roaming\\MetaQuotes\\Terminal\\E62C655ED163FFC555DD40DBEA67E6BB\\MQL5\\Files\\database.sqlite"; // - SQLite DB file name
 
 //+------------------------------------------------------------------+
 //| Validator class for complete trading validation                  |

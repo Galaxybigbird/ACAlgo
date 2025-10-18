@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright   "AC Algo"
 #property link        ""
-#property version     "0.10"
+#property version     "1.00"
 #property strict
 #property description "Stage-2 selector for BreakRevertPro passes"
 
