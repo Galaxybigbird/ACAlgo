@@ -705,7 +705,7 @@ void UpdateAllTrailingStops(bool newBar)
       double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
       double volume = PositionGetDouble(POSITION_VOLUME);
       string positionComment = PositionGetString(POSITION_COMMENT);
-      bool trailingAllowed = TrailingAllowedForPosition(positionComment);
+         bool trailingAllowed = TrailingAllowedForPosition(positionComment, ticket);
       bool compoundedOverrideActive = IsCompoundedTrailingOverride(positionComment);
 
       if(!trailingAllowed)
@@ -713,7 +713,7 @@ void UpdateAllTrailingStops(bool newBar)
 
       if(!ManualTrailingActivated)
       {
-         if(!ShouldActivateTrailing(entryPrice, currentPrice, orderType, volume, compoundedOverrideActive))
+         if(!ShouldActivateTrailing(entryPrice, currentPrice, orderType, volume, compoundedOverrideActive, ticket))
             continue;
       }
 

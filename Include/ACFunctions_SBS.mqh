@@ -9,6 +9,7 @@ extern CSymbolValidator g_SymbolValidator;
 input group "==== AC Risk Management Parameters (SBS) ===="
 input double AC_BaseRisk_Input = 1.0;          // AC BaseRisk
 input double AC_BaseReward_Input = 3.0;        // AC BaseReward & Multiplier
+input bool   AC_BaseRewardIsPercent_Input = false; // Interpret BaseReward as absolute percent
 input int    AC_CompoundingWins_Input = 2;     // AC CompoundingWins
 input bool   AC_EnablePartialCompounding_Input = false; // AC EnablePartialCompounding
 input double AC_PartialCompoundPercent_Input = 25.0;    // AC PartialCompoundPercent (0-100)
@@ -16,6 +17,9 @@ input double AC_PartialCompoundPercent_Input = 25.0;    // AC PartialCompoundPer
 // Mutable copies
 double AC_BaseRisk;
 double AC_BaseReward;
+bool   AC_BaseRewardIsPercent = false;
+double AC_BaseRewardPercent = 0.0;
+double AC_BaseRewardUserValue = 0.0;
 int    AC_CompoundingWins;
 bool   AC_EnablePartialCompoundingFlag = false;
 double AC_PartialCompoundingPercentEffective = 100.0;
@@ -152,7 +156,26 @@ void InitializeACRMSBS(bool resetFromInputs = true)
    if(resetFromInputs)
    {
       AC_BaseRisk = (AC_BaseRisk_Input <= 0) ? 1.0 : AC_BaseRisk_Input;
-      AC_BaseReward = (AC_BaseReward_Input <= 0) ? 3.0 : AC_BaseReward_Input;
+      AC_BaseRewardIsPercent = AC_BaseRewardIsPercent_Input;
+      AC_BaseRewardUserValue = (AC_BaseReward_Input <= 0)
+                               ? (AC_BaseRewardIsPercent ? AC_BaseRisk : 3.0)
+                               : AC_BaseReward_Input;
+      if(AC_BaseRewardIsPercent)
+      {
+         AC_BaseRewardPercent = AC_BaseRewardUserValue;
+         if(AC_BaseRisk > 0.0)
+            AC_BaseReward = AC_BaseRewardPercent / AC_BaseRisk;
+         else
+         {
+            AC_BaseReward = 3.0;
+            AC_BaseRewardPercent = AC_BaseRisk * AC_BaseReward;
+         }
+      }
+      else
+      {
+         AC_BaseReward = AC_BaseRewardUserValue;
+         AC_BaseRewardPercent = AC_BaseRisk * AC_BaseReward;
+      }
       AC_CompoundingWins = (AC_CompoundingWins_Input <= 0) ? 3 : AC_CompoundingWins_Input;
       AC_EnablePartialCompoundingFlag = AC_EnablePartialCompounding_Input;
       double sanitisedPercent = MathMax(0.0, MathMin(100.0, AC_PartialCompoundPercent_Input));
@@ -187,9 +210,20 @@ void InitializeACRMSBS(bool resetFromInputs = true)
 
    lastProcessedDealTime = TimeCurrent();
 
+   // Align saved equity with live equity unless an override is set
+   double accountEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(resetFromInputs || gSavedEquity <= 0.0)
+      gSavedEquity = accountEquity;
+
    Print("===== Asymmetrical Compounding (SBS) Settings =====");
    Print("Base risk: ", AC_BaseRisk, "%");
-   Print("Base reward multiplier: ", AC_BaseReward);
+   if(AC_BaseRewardIsPercent)
+      Print("Base reward target: ", NormalizeDouble(AC_BaseRewardPercent, 2),
+            "% (interpreted as absolute percent, equivalent multiplier 1:",
+            NormalizeDouble(AC_BaseReward, 4), ")");
+   else
+      Print("Base reward multiplier: ", AC_BaseReward, " (targets ",
+            NormalizeDouble(AC_BaseRewardPercent, 2), "% with current base risk)");
    Print("Max consecutive wins to compound: ", AC_CompoundingWins);
    if(AC_EnablePartialCompoundingFlag)
       Print("Partial compounding: Enabled (", NormalizeDouble(AC_PartialCompoundingPercentEffective, 2), "% recycled)");

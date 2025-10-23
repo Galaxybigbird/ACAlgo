@@ -8,7 +8,7 @@
 //+------------------------------------------------------------------+
 #property copyright   "AC Algo"
 #property link        ""
-#property version     "1.04"
+#property version     "1.05"
 #property description "Swing Breakout Sequence base EA with AC risk integration"
 #property strict
 #include <Trade/Trade.mqh>
@@ -108,6 +108,55 @@ void Log(const string message)
   {
    if(InpLogEvents)
       Print(message);
+  }
+
+//+------------------------------------------------------------------+
+//| Detailed AC risk snapshot for trade placement                    |
+//+------------------------------------------------------------------+
+void LogRiskPlan(const string context,bool isBuy,double entryPrice,double stopPrice,double takeProfitPrice,double lots)
+  {
+   int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+   if(digits<=0)
+      digits=(int)_Digits;
+
+   double point=g_SymbolValidator.Point();
+   if(point<=0.0)
+      point=SymbolInfoDouble(_Symbol,SYMBOL_POINT);
+
+   double stopDistance=MathAbs(entryPrice-stopPrice);
+   double rewardDistance=(takeProfitPrice>0.0) ? MathAbs(takeProfitPrice-entryPrice) : 0.0;
+   double stopPoints=(point>0.0) ? stopDistance/point : 0.0;
+   double rewardPoints=(point>0.0) ? rewardDistance/point : 0.0;
+   double rrRatio=(stopPoints>0.0) ? rewardPoints/stopPoints : 0.0;
+   double expectedRewardFromTP=currentRisk * rrRatio;
+   double rewardDiff=expectedRewardFromTP - currentReward;
+
+   string tpText=(takeProfitPrice>0.0) ? DoubleToString(takeProfitPrice,digits) : "DISABLED";
+   string contextTag=context;
+   if(contextTag=="")
+      contextTag="ACRM";
+
+   Print(StringFormat("[ACRM][%s] %s | entry=%s stop=%s (%.1f pts) tp=%s (%.1f pts) lots=%.3f | PlanRisk=%.2f%% TargetReward=%.2f%% (RR %.2f). RewardInput=%.2f (%s, multiplier %.4f). TP mode=%s, InputRR=%.2f, RewardFromTP≈%.2f%% (Δ=%.2f%%). PartialComp=%.2f%%, ConsecutiveWins=%d",
+                      contextTag,
+                      isBuy ? "BUY" : "SELL",
+                      DoubleToString(entryPrice,digits),
+                      DoubleToString(stopPrice,digits),
+                      stopPoints,
+                      tpText,
+                      rewardPoints,
+                      lots,
+                      currentRisk,
+                      currentReward,
+                      rrRatio,
+                      AC_BaseRewardUserValue,
+                      AC_BaseRewardIsPercent ? "percent" : "multiplier",
+                      AC_BaseReward,
+                      InpTPMode==TP_RR ? "RR" : "SWING3",
+                      InpRRTarget,
+                      expectedRewardFromTP,
+                      rewardDiff,
+                      AC_PartialCompoundingPercentEffective,
+                      consecutiveWins));
   }
 
 //+------------------------------------------------------------------+
@@ -954,6 +1003,7 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                double lots=PrepareLots(stop,true,entry,ORDER_TYPE_BUY_STOP);
                if(lots>0.0)
                  {
+                  LogRiskPlan("Breakout|BUY_STOP",true,entry,stop,tp,lots);
                   string comment=BuildOrderComment(ENTRY_BREAKOUT,true,pattern.GuardLevel(),InpInvalidationMode);
                   if(!Trade.BuyStop(lots,entry,_Symbol,stop,tp,0,0,comment))
                      Log(StringFormat("Failed to place breakout buy stop: %s",Trade.ResultRetcodeDescription()));
@@ -979,6 +1029,7 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                double lots=PrepareLots(stop,false,entry,ORDER_TYPE_SELL_STOP);
                if(lots>0.0)
                  {
+                  LogRiskPlan("Breakout|SELL_STOP",false,entry,stop,tp,lots);
                   string comment=BuildOrderComment(ENTRY_BREAKOUT,false,pattern.GuardLevel(),InpInvalidationMode);
                   if(!Trade.SellStop(lots,entry,_Symbol,stop,tp,0,0,comment))
                      Log(StringFormat("Failed to place breakout sell stop: %s",Trade.ResultRetcodeDescription()));
@@ -1006,6 +1057,7 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                double lots=PrepareLots(stop,true,entry,ORDER_TYPE_BUY_LIMIT);
                if(lots>0.0)
                  {
+                  LogRiskPlan("GoldenFib|BUY_LIMIT",true,entry,stop,tp,lots);
                   string comment=BuildOrderComment(ENTRY_GOLDEN_FIB,true,pattern.GuardLevel(),InpInvalidationMode);
                   if(!Trade.BuyLimit(lots,entry,_Symbol,stop,tp,0,0,comment))
                      Log(StringFormat("Failed to place golden-entry buy limit: %s",Trade.ResultRetcodeDescription()));
@@ -1029,6 +1081,7 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
                double lots=PrepareLots(stop,false,entry,ORDER_TYPE_SELL_LIMIT);
                if(lots>0.0)
                  {
+                  LogRiskPlan("GoldenFib|SELL_LIMIT",false,entry,stop,tp,lots);
                   string comment=BuildOrderComment(ENTRY_GOLDEN_FIB,false,pattern.GuardLevel(),InpInvalidationMode);
                   if(!Trade.SellLimit(lots,entry,_Symbol,stop,tp,0,0,comment))
                      Log(StringFormat("Failed to place golden-entry sell limit: %s",Trade.ResultRetcodeDescription()));
@@ -1052,12 +1105,15 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
             double tp=DetermineTakeProfit(true,entryPrice,stop,pattern);
             double lots=PrepareLots(stop,true,entryPrice,ORDER_TYPE_BUY);
             if(lots>0.0)
+              {
+               LogRiskPlan("LiquidityReversal|BUY",true,entryPrice,stop,tp,lots);
                Trade.Buy(lots,_Symbol,0.0,stop,tp,"SBS_LIQREV_BUY");
+              }
            }
-        }
+       }
       else if(!pattern.IsBullish() && InpAllowShorts)
-        {
-         double entryPrice=lastTick.bid;
+       {
+        double entryPrice=lastTick.bid;
          if(entryPrice<=0.0)
             entryPrice=SymbolInfoDouble(_Symbol,SYMBOL_BID);
          double stop=DetermineStop(false,entryPrice,pattern,atrValue);
@@ -1068,9 +1124,12 @@ void PlaceEntries(const CSBSPattern &pattern,double atrValue)
             double tp=DetermineTakeProfit(false,entryPrice,stop,pattern);
             double lots=PrepareLots(stop,false,entryPrice,ORDER_TYPE_SELL);
             if(lots>0.0)
+              {
+               LogRiskPlan("LiquidityReversal|SELL",false,entryPrice,stop,tp,lots);
                Trade.Sell(lots,_Symbol,0.0,stop,tp,"SBS_LIQREV_SELL");
+              }
            }
-        }
+       }
      }
   }
 
@@ -1364,8 +1423,18 @@ void OnTick(void)
      {
       ulong ticket = (ulong)PositionGetInteger(POSITION_TICKET);
       double entry = PositionGetDouble(POSITION_PRICE_OPEN);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      double currentPrice = PositionGetDouble(POSITION_PRICE_CURRENT);
       string orderType = (PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY) ? "BUY" : "SELL";
-      UpdateTrailingStop(ticket, entry, orderType);
+      string positionComment = PositionGetString(POSITION_COMMENT);
+      bool trailingAllowed = TrailingAllowedForPosition(positionComment, ticket);
+      bool compoundedOverrideActive = IsCompoundedTrailingOverride(positionComment);
+
+      if(trailingAllowed)
+        {
+         if(ManualTrailingActivated || ShouldActivateTrailing(entry, currentPrice, orderType, volume, compoundedOverrideActive, ticket))
+            UpdateTrailingStop(ticket, entry, orderType);
+        }
      }
 
    ManagePendingOrders();

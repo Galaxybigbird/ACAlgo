@@ -16,7 +16,9 @@ input int      DEMA_ATR_Period = 14;       // DEMA ATR Period
 input double   DEMA_ATR_Multiplier = 1.5;  // DEMA ATR Multiplier
 input double   TrailingActivationPercent = 1.0; // Activate trailing at this profit %
 input bool     UseATRTrailing = true;      // Enable DEMA-ATRTrailing
-input bool     UseTrailingOnCompoundedTrades = false; // UseTrailingOnCompoundedTrades when main toggle is off
+input bool     UseTrailingOnCompoundedTrades = false; // UseTrailingOnCompoundedTrades
+input bool     UseTimedDelayedTrailing = false; // UseTimedDelayedTrailing
+input int      TrailingDelayMinutes = 5;   // TrailingDelayMinutes
 input double   MinimumStopDistance = 400.0; // MINIMUMStopDistance in points
 
 // Retained constant name for compatibility with legacy modules/tests
@@ -42,6 +44,212 @@ int FailedTrailingUpdates = 0;
 double WorstCaseSlippage = 0;
 double BestCaseProfit = 0;
 
+// Timed delayed trailing state tracking
+ulong    TimedTrailingTickets[];
+double   TimedTrailingRemainingSeconds[];
+bool     TimedTrailingTriggered[];
+bool     TimedTrailingTimerRunning[];
+datetime TimedTrailingLastUpdate[];
+
+//+------------------------------------------------------------------+
+//| Reset trailing stop statistics                                    |
+//+------------------------------------------------------------------+
+void ResetTrailingStats()
+{
+    SuccessfulTrailingUpdates = 0;
+    FailedTrailingUpdates = 0;
+    WorstCaseSlippage = 0;
+    BestCaseProfit = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Reset all timed trailing states                                   |
+//+------------------------------------------------------------------+
+void ResetTimedTrailingStates()
+{
+    ArrayResize(TimedTrailingTickets, 0);
+    ArrayResize(TimedTrailingRemainingSeconds, 0);
+    ArrayResize(TimedTrailingTriggered, 0);
+    ArrayResize(TimedTrailingTimerRunning, 0);
+    ArrayResize(TimedTrailingLastUpdate, 0);
+}
+
+//+------------------------------------------------------------------+
+//| Find the index of a ticket in the timed trailing arrays           |
+//+------------------------------------------------------------------+
+int FindTimedTrailingStateIndex(ulong ticket)
+{
+    for(int i = 0; i < ArraySize(TimedTrailingTickets); ++i)
+    {
+        if(TimedTrailingTickets[i] == ticket)
+            return i;
+    }
+    return -1;
+}
+
+//+------------------------------------------------------------------+
+//| Ensure a timed trailing state exists for the ticket               |
+//+------------------------------------------------------------------+
+int EnsureTimedTrailingState(ulong ticket, double initialSeconds)
+{
+    int idx = FindTimedTrailingStateIndex(ticket);
+    if(idx >= 0)
+        return idx;
+
+    int newSize = ArraySize(TimedTrailingTickets) + 1;
+    ArrayResize(TimedTrailingTickets, newSize);
+    ArrayResize(TimedTrailingRemainingSeconds, newSize);
+    ArrayResize(TimedTrailingTriggered, newSize);
+    ArrayResize(TimedTrailingTimerRunning, newSize);
+    ArrayResize(TimedTrailingLastUpdate, newSize);
+
+    idx = newSize - 1;
+    TimedTrailingTickets[idx] = ticket;
+    TimedTrailingRemainingSeconds[idx] = MathMax(0.0, initialSeconds);
+    TimedTrailingTriggered[idx] = false;
+    TimedTrailingTimerRunning[idx] = false;
+    TimedTrailingLastUpdate[idx] = TimeCurrent();
+
+    return idx;
+}
+
+//+------------------------------------------------------------------+
+//| Remove timed trailing state when position is gone                |
+//+------------------------------------------------------------------+
+void RemoveTimedTrailingState(ulong ticket)
+{
+    int idx = FindTimedTrailingStateIndex(ticket);
+    if(idx < 0)
+        return;
+
+    int last = ArraySize(TimedTrailingTickets) - 1;
+    if(last < 0)
+        return;
+
+    if(idx != last)
+    {
+        TimedTrailingTickets[idx] = TimedTrailingTickets[last];
+        TimedTrailingRemainingSeconds[idx] = TimedTrailingRemainingSeconds[last];
+        TimedTrailingTriggered[idx] = TimedTrailingTriggered[last];
+        TimedTrailingTimerRunning[idx] = TimedTrailingTimerRunning[last];
+        TimedTrailingLastUpdate[idx] = TimedTrailingLastUpdate[last];
+    }
+
+    ArrayResize(TimedTrailingTickets, last);
+    ArrayResize(TimedTrailingRemainingSeconds, last);
+    ArrayResize(TimedTrailingTriggered, last);
+    ArrayResize(TimedTrailingTimerRunning, last);
+    ArrayResize(TimedTrailingLastUpdate, last);
+}
+
+//+------------------------------------------------------------------+
+//| Check if timed trailing has forced activation for ticket          |
+//+------------------------------------------------------------------+
+bool TimedTrailingIsForced(ulong ticket)
+{
+    if(ticket == 0)
+        return false;
+
+    int idx = FindTimedTrailingStateIndex(ticket);
+    if(idx < 0)
+        return false;
+
+    return TimedTrailingTriggered[idx];
+}
+
+//+------------------------------------------------------------------+
+//| Update timed trailing state and return activation status          |
+//+------------------------------------------------------------------+
+bool UpdateTimedDelayedTrailing(ulong ticket, bool thresholdReached, double profitPercent)
+{
+    if(ticket == 0)
+        return false;
+
+    if(!UseTimedDelayedTrailing)
+    {
+        RemoveTimedTrailingState(ticket);
+        return false;
+    }
+
+    if(UseATRTrailing)
+    {
+        RemoveTimedTrailingState(ticket);
+        return false;
+    }
+
+    double delaySeconds = MathMax(0, TrailingDelayMinutes) * 60.0;
+    datetime now = TimeCurrent();
+
+    int idx = FindTimedTrailingStateIndex(ticket);
+
+    if(idx < 0)
+    {
+        if(!thresholdReached)
+            return false;
+
+        idx = EnsureTimedTrailingState(ticket, delaySeconds);
+
+        if(TimedTrailingRemainingSeconds[idx] <= 0.0)
+        {
+            TimedTrailingTriggered[idx] = true;
+            PrintFormat("Timed delayed trailing activated immediately for ticket %I64u at %.2f%% profit (no delay).", ticket, profitPercent);
+            return true;
+        }
+
+        TimedTrailingTimerRunning[idx] = true;
+        TimedTrailingLastUpdate[idx] = now;
+        PrintFormat("Timed trailing countdown started for ticket %I64u at %.2f%% profit. Delay: %d minutes.",
+                    ticket,
+                    profitPercent,
+                    TrailingDelayMinutes);
+    }
+
+    if(TimedTrailingTriggered[idx])
+        return true;
+
+    if(thresholdReached)
+    {
+        if(!TimedTrailingTimerRunning[idx])
+        {
+            TimedTrailingTimerRunning[idx] = true;
+            TimedTrailingLastUpdate[idx] = now;
+            PrintFormat("Timed trailing countdown resumed for ticket %I64u. Remaining %.0f seconds.",
+                        ticket,
+                        TimedTrailingRemainingSeconds[idx]);
+        }
+        else
+        {
+            double elapsed = (double)(now - TimedTrailingLastUpdate[idx]);
+            if(elapsed > 0.0)
+            {
+                TimedTrailingRemainingSeconds[idx] = MathMax(0.0, TimedTrailingRemainingSeconds[idx] - elapsed);
+                TimedTrailingLastUpdate[idx] = now;
+            }
+        }
+
+        if(TimedTrailingRemainingSeconds[idx] <= 0.0)
+        {
+            TimedTrailingTriggered[idx] = true;
+            TimedTrailingTimerRunning[idx] = false;
+            PrintFormat("Timed trailing delay met for ticket %I64u. Activating ATR trailing.", ticket);
+            return true;
+        }
+    }
+    else
+    {
+        if(TimedTrailingTimerRunning[idx])
+        {
+            TimedTrailingTimerRunning[idx] = false;
+            TimedTrailingLastUpdate[idx] = now;
+            PrintFormat("Timed trailing paused for ticket %I64u. Remaining %.0f seconds.",
+                        ticket,
+                        TimedTrailingRemainingSeconds[idx]);
+        }
+    }
+
+    return TimedTrailingTriggered[idx];
+}
+
 //+------------------------------------------------------------------+
 //| Helper: detect whether a trade comment marks a compounded trade  |
 //+------------------------------------------------------------------+
@@ -57,12 +265,15 @@ bool CommentIndicatesCompounding(const string comment)
 //+------------------------------------------------------------------+
 //| Helper: determine if trailing is allowed for the position        |
 //+------------------------------------------------------------------+
-bool TrailingAllowedForPosition(const string positionComment)
+bool TrailingAllowedForPosition(const string positionComment, ulong positionTicket = 0)
 {
     if(ManualTrailingActivated)
         return true;
 
     if(UseATRTrailing)
+        return true;
+
+    if(positionTicket != 0 && TimedTrailingIsForced(positionTicket))
         return true;
 
     if(!UseTrailingOnCompoundedTrades)
@@ -112,6 +323,9 @@ void CleanupATRTrailing()
 
     // No chart objects to manage - visual output removed for tester compatibility
     ClearVisualization();
+
+    // Clear timed trailing state cache
+    ResetTimedTrailingStates();
 }
 
 //+------------------------------------------------------------------+
@@ -130,20 +344,12 @@ void InitDEMAATR()
     ArrayInitialize(AtrDEMA, 0);
     ArrayInitialize(Ema1, 0);
     ArrayInitialize(Ema2, 0);
-    
+
     // Reset statistics
     ResetTrailingStats();
-}
 
-//+------------------------------------------------------------------+
-//| Reset trailing stop statistics                                    |
-//+------------------------------------------------------------------+
-void ResetTrailingStats()
-{
-    SuccessfulTrailingUpdates = 0;
-    FailedTrailingUpdates = 0;
-    WorstCaseSlippage = 0;
-    BestCaseProfit = 0;
+    // Reset timed trailing states for clean session start
+    ResetTimedTrailingStates();
 }
 
 //+------------------------------------------------------------------+
@@ -223,16 +429,15 @@ double CalculateDEMAATR(int period = 0)
 //+------------------------------------------------------------------+
 //| Check if trailing stop should be activated                       |
 //+------------------------------------------------------------------+
-bool ShouldActivateTrailing(double entryPrice, double currentPrice, string orderType, double volume, bool compoundedOverride = false)
+bool ShouldActivateTrailing(double entryPrice, double currentPrice, string orderType, double volume,
+                            bool compoundedOverride = false, ulong positionTicket = 0)
 {
     // Manual override always activates trailing regardless of settings
     if(ManualTrailingActivated)
         return true;
 
     bool trailingEnabled = UseATRTrailing || compoundedOverride;
-    if(!trailingEnabled)
-        return false;
-    
+
     static double lastTrackedEntryPrice = 0.0;
     static bool activationLogged = false;
     
@@ -263,6 +468,16 @@ bool ShouldActivateTrailing(double entryPrice, double currentPrice, string order
     
     double threshold = TrailingActivationPercent - 0.0000001;
     bool reached = (profitPercent >= threshold);
+
+    bool timedTriggered = false;
+    if(!UseATRTrailing && !compoundedOverride)
+        timedTriggered = UpdateTimedDelayedTrailing(positionTicket, reached, profitPercent);
+
+    if(timedTriggered)
+        trailingEnabled = true;
+    
+    if(!trailingEnabled)
+        return false;
     
     if(MathAbs(entryPrice - lastTrackedEntryPrice) > pointValue * 0.5)
     {
@@ -286,7 +501,7 @@ bool ShouldActivateTrailing(double entryPrice, double currentPrice, string order
     
     // Check if profit percentage exceeds activation threshold
     // Add a small epsilon (0.0000001) to handle floating-point precision issues
-    return reached;
+    return (reached || timedTriggered);
 }
 
 //+------------------------------------------------------------------+
@@ -401,11 +616,12 @@ bool UpdateTrailingStop(ulong ticket, double entryPrice, string orderType)
     if(!PositionSelectByTicket(ticket))
     {
         Print("ERROR: Cannot select position ticket ", ticket, " - ", GetLastError());
+        RemoveTimedTrailingState(ticket);
         return false;
     }
-    
+
     string positionComment = PositionGetString(POSITION_COMMENT);
-    if(!TrailingAllowedForPosition(positionComment))
+    if(!TrailingAllowedForPosition(positionComment, ticket))
         return false;
     
     // Get current position data

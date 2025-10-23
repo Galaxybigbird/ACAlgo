@@ -9,6 +9,7 @@
 input group "==== AC Risk Management Parameters ===="
 input double AC_BaseRisk_Input = 1.0;          // AC BaseRisk 
 input double AC_BaseReward_Input = 3.0;        // AC BaseReward & Multiplier 
+input bool   AC_BaseRewardIsPercent_Input = false; // Interpret BaseReward as absolute percent
 input int    AC_CompoundingWins_Input = 2;     // AC CompoundingWins
 input bool   AC_EnablePartialCompounding_Input = false; // AC EnablePartialCompounding
 input double AC_PartialCompoundPercent_Input = 25.0;    // AC PartialCompoundPercent (0-100)
@@ -19,6 +20,9 @@ input double MaxStopLossDistance_Input = 3500.0;    // MAXStopLossDistance in po
 // Mutable global versions of the risk parameters (can be modified by test scripts)
 double AC_BaseRisk;          // Base risk percentage per trade
 double AC_BaseReward;        // Base reward multiplier for calculating target
+bool   AC_BaseRewardIsPercent = false; // Whether user input is interpreted as percent
+double AC_BaseRewardPercent = 0.0;     // Absolute reward percent target for base risk
+double AC_BaseRewardUserValue = 0.0;   // Sanitised user-provided reward input
 int    AC_CompoundingWins;   // Maximum consecutive wins to compound risk
 bool   AC_EnablePartialCompoundingFlag = false;  // Flag controlling partial compounding behaviour
 double AC_PartialCompoundingPercentEffective = 100.0; // Sanitised percentage of reward recycled
@@ -219,7 +223,27 @@ void InitializeACRiskManagement(bool resetFromInputs = true)
    if(resetFromInputs)
    {
       AC_BaseRisk = (AC_BaseRisk_Input <= 0) ? 1.0 : AC_BaseRisk_Input;
-      AC_BaseReward = (AC_BaseReward_Input <= 0) ? 3.0 : AC_BaseReward_Input;
+      AC_BaseRewardIsPercent = AC_BaseRewardIsPercent_Input;
+      AC_BaseRewardUserValue = (AC_BaseReward_Input <= 0)
+                               ? (AC_BaseRewardIsPercent ? AC_BaseRisk : 3.0)
+                               : AC_BaseReward_Input;
+      if(AC_BaseRewardIsPercent)
+      {
+         AC_BaseRewardPercent = AC_BaseRewardUserValue;
+         if(AC_BaseRisk > 0.0)
+            AC_BaseReward = AC_BaseRewardPercent / AC_BaseRisk;
+         else
+         {
+            // Fallback to 1:3 risk-to-reward if risk is invalid
+            AC_BaseReward = 3.0;
+            AC_BaseRewardPercent = AC_BaseRisk * AC_BaseReward;
+         }
+      }
+      else
+      {
+         AC_BaseReward = AC_BaseRewardUserValue;
+         AC_BaseRewardPercent = AC_BaseRisk * AC_BaseReward;
+      }
       AC_CompoundingWins = (AC_CompoundingWins_Input <= 0) ? 3 : AC_CompoundingWins_Input;
       AC_EnablePartialCompoundingFlag = AC_EnablePartialCompounding_Input;
       double sanitisedPercent = MathMax(0.0, MathMin(100.0, AC_PartialCompoundPercent_Input));
@@ -266,10 +290,21 @@ void InitializeACRiskManagement(bool resetFromInputs = true)
    
    // Set lastProcessedDealTime to now so that only future deals are processed
    lastProcessedDealTime = TimeCurrent();
-   
+
+   // Default saved equity to live account equity so sizing honours real balance
+   double accountEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(resetFromInputs || gSavedEquity <= 0.0)
+      gSavedEquity = accountEquity;
+
    Print("========= Asymmetrical Compounding Risk Settings =========");
    Print("Base risk: ", AC_BaseRisk, "% (from input parameter)");
-   Print("Base reward multiplier: ", AC_BaseReward);
+   if(AC_BaseRewardIsPercent)
+      Print("Base reward target: ", NormalizeDouble(AC_BaseRewardPercent, 2),
+            "% (interpreted as absolute percent, equivalent multiplier 1:",
+            NormalizeDouble(AC_BaseReward, 4), ")");
+   else
+      Print("Base reward multiplier: ", AC_BaseReward, " (targets ",
+            NormalizeDouble(AC_BaseRewardPercent, 2), "% with current base risk)");
    Print("Maximum consecutive wins to compound: ", AC_CompoundingWins);
    if(AC_EnablePartialCompoundingFlag)
       Print("Partial compounding: Enabled (", NormalizeDouble(AC_PartialCompoundingPercentEffective, 2), "% of reward recycled)");
@@ -549,11 +584,14 @@ double CalculateLotSize(double stopLossDistance)
     // Calculate money value of one point for 1.0 lot
     double onePointValue = tickValue * ticksPerPoint;
     
-    // IMPROVED: Enforce minimum stop loss distance to prevent extremely tight stops
-    double minStopPoints = 100.0; // Increased minimum to 100 points for better safety
+    // Enforce broker-defined minimum stop distance when available
+    double minStopPoints = g_SymbolValidator.StopsLevel();
+    if(minStopPoints <= 0.0)
+        minStopPoints = 1.0;
+
     if(stopLossInPoints < minStopPoints)
     {
-        Print("WARNING: Stop loss distance (", stopLossInPoints, " points) is too tight. Enforcing minimum of ", minStopPoints, " points.");
+        Print("WARNING: Stop loss distance (", stopLossInPoints, " points) is below broker minimum (", minStopPoints, "). Adjusting to comply.");
         stopLossInPoints = minStopPoints;
         stopLossDistance = stopLossInPoints * point;
     }
@@ -583,21 +621,7 @@ double CalculateLotSize(double stopLossDistance)
         positionSize = maxLot;
     }
     
-    // ADDING: Special handling for small accounts
-    // Skip small account protection when in test mode
-    if(equity < 1000.0 && gSavedEquity <= 0)
-    {
-        // Special handling for very small accounts
-        // Calculate a safe lot size based on risk
-        double maxSafeLot = MathMin(0.1, equity / 10000.0);
-        
-        if(positionSize > maxSafeLot)
-        {
-            Print("WARNING: Small account protection - reducing lot size from ", 
-                 positionSize, " to ", maxSafeLot, " for account equity $", equity);
-            positionSize = maxSafeLot;
-        }
-    }
+    // Legacy small-account cap removed so position size reflects requested risk exactly
     
     // Calculate expected risk with accurate point value
     double expectedRiskAmount = positionSize * stopLossInPoints * onePointValue;
@@ -677,21 +701,15 @@ bool OptimizeRiskParameters(double &volume, double &stopLossDistance)
     double point = g_SymbolValidator.Point();
     double stopLossPoints = stopLossDistance / point;
     
-    // IMPROVED: Enforce minimum stop loss distance
-    double minStopPoints = 100.0; // Increased minimum to 100 points for better safety
+    // Respect broker-defined minimum stop distance
+    double minStopPoints = g_SymbolValidator.StopsLevel();
+    if(minStopPoints <= 0.0)
+        minStopPoints = 1.0;
+
     if(stopLossPoints < minStopPoints)
     {
-        Print("WARNING: Stop loss distance (", stopLossPoints, " points) is too tight. Enforcing minimum of ", minStopPoints, " points.");
+        Print("WARNING: Stop loss distance (", stopLossPoints, " points) is below broker minimum (", minStopPoints, "). Adjusting to comply.");
         stopLossPoints = minStopPoints;
-        stopLossDistance = stopLossPoints * point;
-    }
-    
-    // ADDING: Additional validation for minimum stop loss for low volatility
-    if(stopLossPoints < 50)
-    {
-        Print("WARNING: Extremely low volatility detected - stop loss too tight at ", 
-             stopLossPoints, " points. Enforcing minimum of 50 points.");
-        stopLossPoints = 50.0;
         stopLossDistance = stopLossPoints * point;
     }
     
